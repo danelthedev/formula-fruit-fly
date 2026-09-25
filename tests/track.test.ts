@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { blendSeam, checkpoints, circleCenter, closeLoop, dist, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, resample, sampleArc, sampleLine, segOverlapsExisting, smooth, smoothOpen, validateGeometry, widthAt } from '../src/track.ts';
+import { blendSeam, checkpoints, circleCenter, closeLoop, dist, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, sampleArc, sampleLine, segOverlapsExisting, smooth, smoothOpen, validateGeometry, widthAt } from '../src/track.ts';
 
 test('resample evens spacing on fixture square', () => {
   const sq = [[0, 0], [100, 0], [100, 100], [0, 100]];
@@ -211,8 +211,11 @@ test('closeLoop keeps overlapped track, fills residual chord evenly', () => {
   assert.ok(step < 12, `chord fill step ${step.toFixed(1)}px at seam`);
 });
 
-test('gates world-anchor across rebuilds: no save/load drift', () => {
-  // roundtrip the full pipeline 3x like save/load does; gates must not walk
+test('pipeline is deterministic + world-anchor roundtrips exact (save/load cannot drift)', () => {
+  // design contract: same strokes in → bit-identical centerline out, so undo,
+  // save/load and metadata-only rebuilds never move anything. Dirty-gating in
+  // main.ts ensures the pipeline only runs on changed strokes; load adopts
+  // the saved centerline verbatim.
   const raw: [number, number][] = [];
   for (let x = 0; x <= 400; x += 8) raw.push([x, 0]);
   for (let y = 0; y <= 200; y += 8) raw.push([400, y]);
@@ -223,17 +226,18 @@ test('gates world-anchor across rebuilds: no save/load drift', () => {
     const { loop } = closeLoop(rs);
     return blendSeam(smooth(loop));
   };
-  let center = pipe(raw);
-  let fr = 0.3;
-  const w0 = pointAt(center, true, fr);
-  for (let k = 0; k < 3; k++) {
-    const world = pointAt(center, true, fr); // app: world-anchor before rebuild
-    center = pipe(center);
-    fr = nearestIndex(center, world) / center.length; // re-snap
+  assert.deepEqual(pipe(raw), pipe(raw)); // deterministic: same in, same out
+  const center = pipe(raw);
+  for (const fr of [0.05, 0.3, 0.55, 0.8]) {
+    const w = pointAt(center, true, fr);
+    const back = pointAt(center, true, projectFraction(center, true, w));
+    assert.ok(Math.hypot(back[0] - w[0], back[1] - w[1]) < 1e-9, `anchor roundtrip moved ${fr}`);
   }
-  const w1 = pointAt(center, true, fr);
-  assert.ok(Math.hypot(w1[0] - w0[0], w1[1] - w0[1]) < 8, 'gate walked across save/loads');
+  const file = JSON.parse(JSON.stringify({ centerline: center, gates: [0.05, 0.3], gateWidths: [60, 60] }));
+  assert.deepEqual(file.centerline, center); // save/load preserves values bit-exactly
+  assert.deepEqual(file.gates, [0.05, 0.3]);
 });
+
 
 test('segOverlapsExisting: dense raw bridges pass both ways, true crossings caught', () => {
   // regresses the red-green join bug: point-count exclusion zones assumed 8px

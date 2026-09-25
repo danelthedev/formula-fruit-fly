@@ -1,4 +1,4 @@
-import { blendSeam, checkpoints, closeLoop, dist, edges, gateAt, nearestIndex, pointAt, resample, ribbon, sampleArc, sampleLine, seamPatch, segOverlapsExisting, smooth, smoothOpen, uid, validateGeometry } from './track';
+import { blendSeam, checkpoints, closeLoop, dist, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, sampleArc, sampleLine, seamPatch, segOverlapsExisting, smooth, smoothOpen, uid, validateGeometry } from './track';
 import type { Pt, Track } from './track';
 import { deleteTrack, listTracks, loadDraft, loadPieces, loadView, saveDraft, savePieces, saveTrack, saveView } from './storage';
 
@@ -25,6 +25,9 @@ let active = 0;
 interface Snap { pieces: Pt[][]; gates: number[]; widths: number[]; general: number; start: number }
 let history: Snap[] = [];
 let hIndex = -1;
+let piecesVersion = 0; // bumped on every stroke-data mutation (never on width/gate/start)
+let builtFor: { v: number; active: number } | null = null; // geometry the live centerline was built from
+function touchPieces() { piecesVersion++; }
 let track: Track | null = null;
 let tool: 'free' | 'line' | 'arc' | 'erase' | 'gate' = 'free';
 let panning = false;
@@ -86,7 +89,7 @@ function pushHistory() {
 // these up instead of the live track's, since the live track is about to be replaced.
 let incoming: { gates: number[]; widths: number[]; start: number } | null = null;
 function applySnap(s: Snap) {
-  pieces = clonePieces(s.pieces); fixActive();
+  pieces = clonePieces(s.pieces); fixActive(); touchPieces();
   incoming = { gates: s.gates.slice(), widths: s.widths.slice(), start: s.start };
   els.width.value = String(s.general); els.widthVal.textContent = String(s.general);
   selectedGate = null;
@@ -105,11 +108,18 @@ function buildFromPiece(piece: Pt[]): { center: Pt[]; closed: boolean } | null {
 // geometry crosses itself (stays on last-good state). Ribbon overlaps merge.
 function rebuildTrack(keepStart = true): boolean {
   lastRejection = null; // fresh verdict each rebuild; set below on reject
-  if (!pieces.length) { track = null; persist(); render(); return true; }
+  if (!pieces.length) { track = null; builtFor = null; persist(); render(); return true; }
   fixActive();
-  const built = buildFromPiece(pieces[active]);
-  if (!built || built.center.length < 2) { track = null; persist(); render(); return true; }
   const w = Number(els.width.value);
+  if (builtFor && builtFor.v === piecesVersion && builtFor.active === active && track) {
+    // Strokes unchanged: reuse the stored centerline verbatim. Reprocessing clean
+    // data is pure loss (resample renumbering, trim/fill flicker) and is what made
+    // gates creep across saves. Only metadata can have changed.
+    track.width = w;
+    persist(); render(); return true;
+  }
+  const built = buildFromPiece(pieces[active]);
+  if (!built || built.center.length < 2) { track = null; builtFor = { v: piecesVersion, active }; persist(); render(); return true; }
   // gates/start ride along as geography, not indices: resampling shifts indices
   // every pass (gates used to walk ~30px per save/load). Undo restores verbatim.
   const prevCenter = track?.centerline, hadCenter = !!prevCenter && prevCenter.length >= 2;
@@ -122,10 +132,10 @@ function rebuildTrack(keepStart = true): boolean {
     startS = incoming.start;
     incoming = null;
   } else {
-    gates = gateWorld.map((p) => nearestIndex(built.center, p) / built.center.length);
+    gates = gateWorld.map((p) => projectFraction(built.center, built.closed, p));
     widths = (track?.gateWidths ?? []).slice(0, gates.length);
     while (widths.length < gates.length) widths.push(w);
-    startS = startWorld ? nearestIndex(built.center, startWorld) : keepStart ? (track?.startS ?? 0) : 0;
+    startS = startWorld ? Math.round(projectFraction(built.center, built.closed, startWorld) * built.center.length) % built.center.length : keepStart ? (track?.startS ?? 0) : 0;
   }
   if (built.closed && validateGeometry(built.center, w) === 'crossed') {
     applySnap(history[hIndex]);
@@ -148,6 +158,7 @@ function rebuildTrack(keepStart = true): boolean {
     gateWidths: widths,
   };
   if (track.startS >= built.center.length) track.startS = 0;
+  builtFor = { v: piecesVersion, active };
   persist(); render();
   return true;
 }
@@ -208,7 +219,7 @@ function addStroke(seg: Pt[], attach: 'head' | 'tail' | 'new', label = 'Stroke')
     if (attach === 'head') A[0] = [...A[A.length - 1]] as Pt;
     else A[A.length - 1] = [...A[0]] as Pt;
   }
-  commit();
+  touchPieces(); commit();
   if (track?.closed && (tool === 'free' || tool === 'line' || tool === 'arc')) {
     setTool('gate'); // closed → next job is checkpoints
     say(`Loop closed (${track.centerline.length} pts) — place checkpoints or set the start line.`);
@@ -236,7 +247,7 @@ function eraseAt(p: Pt): boolean {
   });
   const after = out.flat().length;
   if (after === before) return false;
-  pieces = out;
+  pieces = out; touchPieces();
   active = 0;
   pieces.forEach((pc, i) => { if (pc.length > pieces[active].length) active = i; });
   fixActive(); rebuildTrack();
@@ -533,7 +544,7 @@ els.redo.onclick = () => {
   applySnap(history[hIndex]);
   rebuildTrack(); say('Redo');
 };
-els.clear.onclick = () => { pieces = []; active = 0; arcPts = []; hover = null; selectedGate = null; commit(); say('Cleared'); };
+els.clear.onclick = () => { pieces = []; active = 0; arcPts = []; hover = null; selectedGate = null; touchPieces(); commit(); say('Cleared'); };
 els.width.oninput = () => {
   els.widthVal.textContent = els.width.value;
   // untouched gates (still at the old general width) follow the slider; customized stay
@@ -649,11 +660,15 @@ els.save.onclick = () => {
 };
 els.load.onclick = () => {
   const t = listTracks().find((t) => t.id === els.sel.value);
-  if (!t) return;
+  if (!t || t.centerline.length < 2) return;
   track = { ...t, gates: t.gates ?? [], gateWidths: t.gateWidths ?? (t.gates ?? []).map(() => t.width) };
+  track.closed = t.closed ?? dist(track.centerline[0], track.centerline[track.centerline.length - 1]) < 60;
+  track.startS = Math.min(track.startS ?? 0, track.centerline.length - 1);
   pieces = [t.centerline.map((p) => [...p] as Pt)]; active = 0; selectedGate = null;
+  touchPieces();
+  builtFor = { v: piecesVersion, active }; // verbatim: saved centerline needs no reprocessing
   els.width.value = String(t.width); els.widthVal.textContent = String(t.width);
-  commit(); say(`Loaded "${t.name}"`);
+  pushHistory(); persist(); render(); say(`Loaded "${t.name}"`);
 };
 els.del.onclick = () => { if (els.sel.value) { deleteTrack(els.sel.value); refreshList(); say('Deleted'); } };
 els.exp.onclick = () => {
@@ -671,8 +686,12 @@ els.file.onchange = async () => {
     const t = JSON.parse(await f.text()) as Track;
     if (!t.centerline?.length) throw new Error('bad file');
     track = { ...t, id: uid(), gates: t.gates ?? [], gateWidths: t.gateWidths ?? (t.gates ?? []).map(() => t.width) };
+    track.closed = t.closed ?? dist(track.centerline[0], track.centerline[track.centerline.length - 1]) < 60;
+    track.startS = Math.min(track.startS ?? 0, track.centerline.length - 1);
     pieces = [track.centerline.map((p) => [...p] as Pt)]; active = 0; selectedGate = null;
-    commit(); refreshList(); say(`Imported (${track.centerline.length} pts)`);
+    touchPieces();
+    builtFor = { v: piecesVersion, active }; // verbatim: no reprocessing
+    pushHistory(); refreshList(); say(`Imported (${track.centerline.length} pts)`);
   } catch { say('Import failed: invalid track JSON'); }
   els.file.value = '';
 };
@@ -702,6 +721,7 @@ function fitCanvas() {
       sc(pieces);
       for (const hs of history) sc(hs.pieces);
       if (track) for (const p of track.centerline) { p[0] *= sx; p[1] *= sy; } // keep prev-center in post-scale space for world-anchoring
+      touchPieces(); // scaled geometry must rebuild once
       drawing = null; lineStart = null; hover = null;
     }
     canvas.width = w; canvas.height = h;

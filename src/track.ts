@@ -38,23 +38,13 @@ export function resample(pts: Pt[], step = 8, closed = true): Pt[] {
 }
 
 // Chaikin smoothing (cyclic), keeps shape, kills jitter.
-// Skips already-smooth loops: re-smoothing every pass shrinks the track a little
-// each time (gates/track visibly creep across save/loads). Fixed point = stable.
+// Runs only on new/changed strokes (rebuilds are dirty-gated in main.ts),
+// so no skip threshold is needed here — and none could be reliable anyway.
 export function smooth(pts: Pt[], iters = 2): Pt[] {
   if (!pts.length) return [];
-  const n = pts.length;
-  const p0 = pts[0]; // pinned every iter: index-0 geography must not walk
-  let mt = 0;
-  for (let i = 0; i < n; i++) {
-    const a = pts[i], b = pts[(i + 1) % n], c = pts[(i + 2) % n];
-    const v0 = [b[0] - a[0], b[1] - a[1]], v1 = [c[0] - b[0], c[1] - b[1]];
-    const l0 = Math.hypot(v0[0], v0[1]) || 1, l1 = Math.hypot(v1[0], v1[1]) || 1;
-    mt = Math.max(mt, Math.abs(Math.atan2(v0[0] * v1[1] - v0[1] * v1[0], v0[0] * v1[0] + v0[1] * v1[1])));
-  }
-  if (mt < 0.12) return resample(pts, 8, true); // ~7°: already smooth, even spacing only
   let cur = pts;
   for (let it = 0; it < iters; it++) {
-    const out: Pt[] = [p0];
+    const out: Pt[] = [];
     for (let i = 0; i < cur.length; i++) {
       const p = cur[i], q = cur[(i + 1) % cur.length];
       out.push([p[0] * 0.75 + q[0] * 0.25, p[1] * 0.75 + q[1] * 0.25]);
@@ -89,17 +79,10 @@ export function closeLoop(pts: Pt[], snap = 60): { loop: Pt[]; closed: boolean }
 
 // Cut the closure corner and bridge it with a tangent-matched Hermite spline.
 // G1-continuous by construction: no kink, no fill wedge at the seam.
-// (Laplacian relax only rounds the kink; the tangent break survived.)
+// Runs only on new/changed strokes (dirty-gated), so it always blends once.
 export function blendSeam(loop: Pt[], cut = 4): Pt[] {
   const n = loop.length;
   if (n < 16) return loop;
-  // already smooth? skip the cut: re-cutting walks index 0 every pass
-  // (gate fractions are index-relative, so the seam must sit still).
-  const v0 = [loop[1][0] - loop[0][0], loop[1][1] - loop[0][1]];
-  const v1 = [loop[0][0] - loop[n - 1][0], loop[0][1] - loop[n - 1][1]];
-  const l0 = Math.hypot(v0[0], v0[1]) || 1, l1 = Math.hypot(v1[0], v1[1]) || 1;
-  const ang = Math.acos(Math.max(-1, Math.min(1, (v0[0] * v1[0] + v0[1] * v1[1]) / (l0 * l1))));
-  if (ang < 0.2) return resample(loop, 8, true); // ~11°: even spacing only
   const c = Math.max(2, Math.min(cut, Math.floor(n / 8)));
   const A = loop[(n - c) % n], B = loop[c % n];
   const pA = loop[(n - c - 3 + n) % n], nB = loop[(c + 3) % n]; // wide stencil: stable tangents
@@ -275,6 +258,26 @@ export function pointAt(center: Pt[], closed: boolean, fr: number): Pt {
   const i = Math.floor(f) % n, r = f - Math.floor(f);
   const j = closed ? (i + 1) % n : Math.min(i + 1, n - 1);
   return [center[i][0] + (center[j][0] - center[i][0]) * r, center[i][1] + (center[j][1] - center[i][1]) * r];
+}
+
+// Exact arc fraction of the nearest point on a polyline (segment projection,
+// not vertex snapping). Re-snapping the same world spot is exact to ~1e-9, so
+// gates/start don't ratchet when resampling renumbers vertices across save/load.
+export function projectFraction(center: Pt[], closed: boolean, p: Pt): number {
+  const n = center.length;
+  if (n < 2) return 0;
+  let best = Infinity, bi = 0, bt = 0;
+  const segs = closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const a = center[i], b = center[(i + 1) % n];
+    const vx = b[0] - a[0], vy = b[1] - a[1];
+    const L2 = vx * vx + vy * vy || 1;
+    const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / L2));
+    const dx = p[0] - (a[0] + vx * t), dy = p[1] - (a[1] + vy * t);
+    const d = dx * dx + dy * dy;
+    if (d < best) { best = d; bi = i; bt = t; }
+  }
+  return (bi + bt) / n;
 }
 
 // Edge polylines (clamped indices: correct for open drafts too).
