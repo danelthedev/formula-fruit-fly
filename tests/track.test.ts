@@ -1,0 +1,214 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { blendSeam, bridgeGap, checkpoints, circleCenter, closeLoop, edges, gateAt, hasSelfIntersection, minSelfSeparation, resample, sampleArc, sampleLine, smooth, smoothOpen, validateGeometry, widthAt } from '../src/track.ts';
+
+test('resample evens spacing on fixture square', () => {
+  const sq = [[0, 0], [100, 0], [100, 100], [0, 100]];
+  const r = resample(sq, 10, true);
+  assert.ok(r.length >= 30 && r.length <= 50, `n=${r.length}`);
+});
+
+test('intersection: figure-eight rejected, oval accepted', () => {
+  const oval = Array.from({ length: 32 }, (_, i) => {
+    const a = (i / 32) * Math.PI * 2;
+    return [Math.cos(a) * 100, Math.sin(a) * 60] as [number, number];
+  });
+  const eight = Array.from({ length: 32 }, (_, i) => {
+    const a = (i / 32) * Math.PI * 2;
+    return [Math.sin(a) * 100, Math.sin(a) * Math.cos(a) * 60] as [number, number];
+  });
+  assert.equal(hasSelfIntersection(oval), false);
+  assert.equal(hasSelfIntersection(eight), true);
+});
+
+test('closeLoop cuts overshoot past start, keeps overlapped track', () => {
+  const loop = [...Array.from({ length: 40 }, (_, i) => {
+    const a = (i / 40) * Math.PI * 2;
+    return [Math.cos(a) * 100, Math.sin(a) * 100] as [number, number];
+  }), [95, 5] as [number, number], [80, 10] as [number, number], [60, 20] as [number, number]];
+  const { loop: out, closed } = closeLoop(loop);
+  assert.equal(closed, true);
+  assert.equal(out.length, 41); // overshoot pair trimmed, overlapping [95,5] kept
+  assert.equal(closeLoop([[0, 0], [200, 0]]).closed, false);
+});
+
+test('blendSeam cuts the closure corner with even spacing, no kink', () => {
+  // square closed AT a corner: 90° joint at index 0
+  const sq: [number, number][] = [[0, 0], [200, 0], [200, 200], [0, 200], [0, 0]];
+  const rs = resample(sq, 8, false);
+  const { loop, closed } = closeLoop(rs);
+  assert.equal(closed, true);
+  const bl = blendSeam(smooth(loop));
+  const n = bl.length;
+  const jump = (a: [number, number], b: [number, number]) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+  const turn = (i: number): number => {
+    const p = bl[i], q = bl[(i + 1) % n], r = bl[(i + 2) % n];
+    const v1 = [q[0] - p[0], q[1] - p[1]], v2 = [r[0] - q[0], r[1] - q[1]];
+    return Math.abs(Math.atan2(v1[0] * v2[1] - v1[1] * v2[0], v1[0] * v2[0] + v1[1] * v2[1])) * 180 / Math.PI;
+  };
+  let mj = 0;
+  for (let i = 0; i < n; i++) mj = Math.max(mj, jump(bl[i], bl[(i + 1) % n]));
+  assert.ok(mj < 12, `seam spacing jump ${mj.toFixed(1)}px`);
+  let mt = 0;
+  for (let k = -15; k <= 15; k++) mt = Math.max(mt, turn(((k % n) + n) % n));
+  assert.ok(mt < 50, `residual kink ${mt.toFixed(0)}° at seam`); // drawn corners elsewhere keep their shape
+});
+
+test('line samples straight, arc stays on circle through 3 pts', () => {
+  const line = sampleLine([0, 0], [100, 0]);
+  assert.ok(line.length > 5 && line.every((p) => Math.abs(p[1]) < 1e-9));
+  assert.deepEqual(line[0], [0, 0]);
+  const arc = sampleArc([100, 0], [0, 100], [-100, 0]);
+  const c = circleCenter([100, 0], [0, 100], [-100, 0])!;
+  const r = Math.hypot(100 - c[0], 0 - c[1]);
+  assert.ok(arc.every((p) => Math.abs(Math.hypot(p[0] - c[0], p[1] - c[1]) - r) < 1e-6));
+  assert.ok(Math.hypot(arc[0][0] - 100, arc[0][1]) < 1e-6);
+  assert.ok(arc.some((p) => Math.hypot(p[0], p[1] - 100) < 9)); // passes via point
+  assert.equal(circleCenter([0, 0], [1, 1], [2, 2]), null); // collinear
+});
+
+test('overlap guard: out-and-back flagged, clean oval passes', () => {
+  const pts: [number, number][] = [];
+  for (let x = 0; x <= 200; x += 8) pts.push([x, 0]);
+  for (let x = 200; x >= 0; x -= 8) pts.push([x, 20]); // 20px parallel, width 60
+  assert.ok(minSelfSeparation(pts, 10, false) < 60);
+  const oval = Array.from({ length: 120 }, (_, i) => {
+    const a = (i / 120) * Math.PI * 2;
+    return [Math.cos(a) * 200, Math.sin(a) * 120] as [number, number];
+  });
+  assert.ok(minSelfSeparation(oval, 16, true) > 60);
+});
+
+test('bridgeGap closes near-miss, ignores wide gaps; smoothOpen keeps endpoints', () => {
+  const near: [number, number][] = [[0, 0], [100, 0], [100, 100], [10, 100]]; // 10px gap
+  const bridged = bridgeGap(near);
+  assert.ok(closeLoop(bridged).closed);
+  const far: [number, number][] = [[0, 0], [100, 0], [100, 100], [400, 400]];
+  assert.equal(bridgeGap(far).length, far.length); // untouched
+  assert.equal(closeLoop(bridgeGap(far)).closed, false);
+  const kink: [number, number][] = [[0, 0], [50, 0], [50, 50], [100, 50]];
+  const sm = smoothOpen(kink);
+  const d0 = Math.hypot(sm[0][0], sm[0][1]);
+  const d1 = Math.hypot(sm[sm.length - 1][0] - 100, sm[sm.length - 1][1] - 50);
+  assert.ok(d0 < 8 && d1 < 12); // endpoints pinned (resample stops ≤1 step short)
+  assert.ok(sm.length > kink.length); // subdivided
+});
+
+test('hairpins merge (ok), crossings rejected', () => {
+  // stadium with tight top: legs 30px apart, width 60 -> old code rejected, now hairpin
+  const u: [number, number][] = [];
+  for (let y = 0; y <= 200; y += 10) u.push([0, y]);
+  for (let a = 1; a <= 9; a++) {
+    const t = Math.PI + (a / 10) * Math.PI;
+    u.push([15 + 15 * Math.cos(t), 200 + 15 * Math.sin(t)]);
+  }
+  for (let y = 200; y >= 0; y -= 10) u.push([30, y]);
+  u.push([30, -100], [0, -100], [0, 0]); // bottom connector, far away
+  assert.equal(validateGeometry(u, 60), 'ok');
+  const eight = Array.from({ length: 32 }, (_, i) => {
+    const a = (i / 32) * Math.PI * 2;
+    return [Math.sin(a) * 100, Math.sin(a) * Math.cos(a) * 60] as [number, number];
+  });
+  assert.equal(validateGeometry(eight, 60), 'crossed');
+});
+
+test('checkpoints hug road edges across widths', () => {
+  const center = Array.from({ length: 120 }, (_, i) => {
+    const a = (i / 120) * Math.PI * 2;
+    return [Math.cos(a) * 200, Math.sin(a) * 120] as [number, number];
+  });
+  for (const w of [40, 100]) {
+    const t = { id: 'x', name: 'x', centerline: center, width: w, startS: 0, closed: true,
+      gates: Array.from({ length: 12 }, (_, k) => k / 12) };
+    const all = [...edges(t).left, ...edges(t).right];
+    for (const g of checkpoints(t))
+      for (const p of [g.a, g.b]) {
+        const d = Math.min(...all.map((q) => Math.hypot(p[0] - q[0], p[1] - q[1])));
+        assert.ok(d < 0.01, `gate end ${d.toFixed(2)}px off edge at w=${w}`); // exact by construction
+      }
+  }
+});
+
+test('inner edge clamps on hairpins tighter than half-width (no cusp zigzag)', () => {
+  // 180° arc r=30 with width 120: raw parallel offset would cusp-fold here
+  const arc: [number, number][] = [];
+  for (let a = 0; a <= 20; a++) {
+    const t = Math.PI - (a / 20) * Math.PI;
+    arc.push([100 + 30 * Math.cos(t), 100 + 30 * Math.sin(t)]);
+  }
+  for (let y = 90; y >= -200; y -= 10) arc.push([130, y]); // out leg down
+  for (let a = 1; a <= 9; a++) { // bottom U-turn
+    const t = -(a / 10) * Math.PI;
+    arc.push([100 + 30 * Math.cos(t), -200 + 30 * Math.sin(t)]);
+  }
+  for (let y = -190; y <= 100; y += 10) arc.push([70, y]); // in leg up, ends at arc start: closed loop
+  const t = { id: 'x', name: 'x', centerline: resample(arc, 8, true), width: 120, startS: 0, closed: true, gates: [0.1, 0.4, 0.7] }; // resampled: matches app even-spacing
+  for (const poly of [edges(t).left, edges(t).right]) {
+    for (let i = 1; i < poly.length - 1; i++) {
+      const v1 = [poly[i][0] - poly[i - 1][0], poly[i][1] - poly[i - 1][1]];
+      const v2 = [poly[i + 1][0] - poly[i][0], poly[i + 1][1] - poly[i][1]];
+      const turn = Math.abs(Math.atan2(v1[0] * v2[1] - v1[1] * v2[0], v1[0] * v2[0] + v1[1] * v2[1])) * 180 / Math.PI;
+      if (turn < 100) continue;
+      // spike height: ignore sub-pixel wiggles, flag real triangles
+      const ax = poly[i - 1], bx = poly[i + 1], p = poly[i];
+      const dx = bx[0] - ax[0], dy = bx[1] - ax[1], L2 = dx * dx + dy * dy || 1;
+      const tt = Math.max(0, Math.min(1, ((p[0] - ax[0]) * dx + (p[1] - ax[1]) * dy) / L2));
+      const h = Math.hypot(p[0] - (ax[0] + dx * tt), p[1] - (ax[1] + dy * tt));
+      assert.ok(h < 6, `edge folds back: ${turn.toFixed(0)}° height ${h.toFixed(1)}px at ${i}`);
+    }
+  }
+  for (const g of checkpoints(t))
+    assert.ok(Math.hypot(g.a[0] - g.b[0], g.a[1] - g.b[1]) <= 120, 'gate wider than road');
+});
+
+test('gates never leap to a neighboring road section', () => {
+  // S-curve pinched 25px from a straight: gates must stay local (≈ road width)
+  const pts: [number, number][] = [];
+  for (let y = 0; y <= 400; y += 8) pts.push([0, y]); // straight
+  for (let y = 0; y <= 400; y += 8) pts.push([55 + 30 * Math.sin(y / 45), 400 - y]); // S back
+  pts.push([0, -120], [-80, -120], [-80, 480], [0, 480]); // far connector
+  const t = { id: 'x', name: 'x', centerline: pts, width: 60, startS: 0, closed: true,
+    gates: Array.from({ length: 48 }, (_, k) => k / 48) };
+  for (const g of checkpoints(t)) {
+    const len = Math.hypot(g.a[0] - g.b[0], g.a[1] - g.b[1]);
+    assert.ok(len < 100, `gate spans ${len.toFixed(0)}px — leapt sections`);
+  }
+});
+
+test('manual gates: toggle semantics (sorted fractions, start gate independent)', () => {
+  const oval = Array.from({ length: 120 }, (_, i) => {
+    const a = (i / 120) * Math.PI * 2;
+    return [Math.cos(a) * 200, Math.sin(a) * 120] as [number, number];
+  });
+  const t = { id: 'x', name: 'x', centerline: oval, width: 60, startS: 0, closed: true, gates: [0.1, 0.5, 0.9] };
+  const cps = checkpoints(t);
+  assert.equal(cps.length, 3);
+  assert.ok(Math.abs(cps[0].s - 12) < 1e-9 && Math.abs(cps[2].s - 108) < 1e-9); // fractions map to arc
+  const s0 = gateAt(t, 0.3); // start line anywhere, independent of gates
+  assert.ok(Math.abs(s0.s - 0.3 * 120) < 1e-9);
+});
+
+test('widthAt interpolates gate widths, falls back to general', () => {
+  const base = { id: 'x', name: 'x', centerline: [[0, 0], [10, 0]], width: 60, startS: 0, closed: true, gates: [0, 0.5] as number[], gateWidths: [40, 80] as number[] };
+  assert.equal(widthAt(base, 0), 40);
+  assert.equal(widthAt(base, 0.5), 80);
+  assert.ok(Math.abs(widthAt(base, 0.25) - 60) < 1e-9); // cosine midpoint
+  assert.ok(Math.abs(widthAt(base, 0.75) - 60) < 1e-9); // wraps other way
+  assert.equal(widthAt({ ...base, gates: [] }, 0.3), 60); // no gates: general
+  assert.equal(widthAt({ ...base, gates: [0.2], gateWidths: [44] }, 0.9), 44); // single: constant
+});
+
+test('closeLoop keeps overlapped track, fills residual chord evenly', () => {
+  // out 500px then back over itself, ending 10px past start: overlap must survive
+  const pts: [number, number][] = [[0, 0], [100, 0], [200, 0], [300, 0], [400, 0], [500, 0], [400, 0], [300, 0], [200, 0], [100, 0], [10, 0]];
+  const { loop, closed } = closeLoop(pts);
+  assert.equal(closed, true);
+  assert.equal(loop.length, 11); // old trim ate the doubled-back stretch
+  // near-miss gap gets bridged with even spacing (no chord jump)
+  const gapped: [number, number][] = [[0, 0], [100, 0], [200, 0], [200, 100], [100, 100], [30, 40]];
+  const r2 = closeLoop(gapped);
+  assert.equal(r2.closed, true);
+  assert.equal(r2.loop.length, 11); // 6 raw + 5 chord fillers
+  const step = Math.hypot(r2.loop[6][0] - r2.loop[5][0], r2.loop[6][1] - r2.loop[5][1]);
+  assert.ok(step < 12, `chord fill step ${step.toFixed(1)}px at seam`);
+});

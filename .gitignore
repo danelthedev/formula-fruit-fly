@@ -1,0 +1,32 @@
+# deps / build
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# logs / caches
+logs/
+*.log
+npm-debug.log*
+.vite/
+*.tsbuildinfo
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# agent session state (local)
+.pi/
+
+# scratch screenshots / tracks
+*.png
+!docs/*.png
+/tmp/

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Racing Sim — Track Maker</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Racing Sim <span id="story-tag">· Story 1: Track Maker</span></h1>
+      <div id="status" role="status"></div>
+    </header>
+    <main>
+      <canvas id="editor" width="960" height="600"></canvas>
+      <aside id="panel">
+        <section>
+          <h2>History</h2>
+          <p class="hint">Drag on canvas to draw. Release near start to close. Self-crossing strokes are rejected.</p>
+          <div class="row">
+            <button id="btn-undo">Undo</button>
+            <button id="btn-redo">Redo</button>
+            <button id="btn-clear">Clear</button>
+          </div>
+        </section>
+        <section>
+          <h2>Tools</h2>
+          <div class="row">
+            <button id="btn-tool-free" class="active">Free</button>
+            <button id="btn-tool-line">Line</button>
+            <button id="btn-tool-arc">Arc</button>
+            <button id="btn-tool-erase">Erase</button>
+            <button id="btn-tool-gate">Checkpoint</button>
+          </div>
+          <p class="hint">Draw halves from the glowing dots — ends snap and merge. Erase cuts sections out.</p>
+        </section>
+        <section>
+          <h2>Road</h2>
+          <label>Width <input id="in-width" type="range" min="20" max="120" value="60" /> <span id="width-val">60</span></label>
+          <div class="row">
+            <button id="btn-start">Set start: off</button>
+          </div>
+          <div id="gate-editor" hidden>
+            <h2 id="gate-title">Checkpoint</h2>
+            <label>Gate width <input id="in-gate-width" type="range" min="20" max="160" value="60" /> <span id="gate-width-val">60</span></label>
+            <div class="row">
+              <button id="btn-gate-remove">Remove checkpoint</button>
+            </div>
+          </div>
+        </section>
+        <section>
+          <h2>Saved tracks</h2>
+          <div class="row">
+            <input id="in-name" placeholder="track name" />
+            <button id="btn-save">Save</button>
+          </div>
+          <div class="row">
+            <select id="sel-tracks"></select>
+            <button id="btn-load">Load</button>
+            <button id="btn-del">Delete</button>
+          </div>
+          <div class="row">
+            <button id="btn-export">Export JSON</button>
+            <button id="btn-import">Import JSON</button>
+            <input id="file-import" type="file" accept="application/json" hidden />
+          </div>
+        </section>
+        <section>
+          <h2>Checklist</h2>
+          <ul id="checks"></ul>
+        </section>
+      </aside>
+    </main>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
