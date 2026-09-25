@@ -1,3 +1,4 @@
+import { buildMask, extractCore, largestComponent, prune, simplifySkeleton, thin, traceLoop } from './skeleton';
 import { blendSeam, checkpoints, closeLoop, dist, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, sampleArc, sampleLine, seamPatch, segOverlapsExisting, smooth, smoothOpen, uid, validateGeometry } from './track';
 import type { Pt, Track } from './track';
 import { deleteTrack, listTracks, loadDraft, loadPieces, loadView, saveDraft, savePieces, saveTrack, saveView } from './storage';
@@ -695,6 +696,80 @@ els.file.onchange = async () => {
   } catch { say('Import failed: invalid track JSON'); }
   els.file.value = '';
 };
+gid('btn-import-img').onclick = () => gid('file-image').click();
+(gid('file-image') as HTMLInputElement).onchange = async (e) => {
+  const f = (e.target as HTMLInputElement).files?.[0];
+  (e.target as HTMLInputElement).value = '';
+  if (!f) return;
+  try {
+    say('Tracing image…');
+    const loop = await traceImageFile(f, canvas.width, canvas.height);
+    if (loop.length < 8) { say('No track found — need one-color circuit on plain background.'); return; }
+    pieces = [loop]; active = 0; selectedGate = null;
+    commit(); say(`Traced ${loop.length} pts — set width, checkpoints, start.`);
+  } catch { say('Image import failed.'); }
+};
+
+// Rasterize svg/png/jpg to a mask grid, thin to a skeleton, trace the loop,
+// then fit it into the canvas. One code path for all formats.
+const IMG_GRID = 512;
+function loadImageEl(url: string): Promise<HTMLImageElement> {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = rej;
+    img.src = url;
+  });
+}
+async function traceImageFile(f: File, cw: number, ch: number): Promise<Pt[]> {
+  // svg without width/height rasterizes at garbage size: patch from viewBox first.
+  let blob: Blob = f;
+  if (/\.svg$/i.test(f.name) || f.type === 'image/svg+xml') {
+    const text = await f.text();
+    if (!/\swidth\s*=/.test(text.match(/<svg[^>]*>/)?.[0] ?? '')) {
+      const vb = text.match(/viewBox\s*=\s*"([\d.\s-]+)"/)?.[1].split(/\s+/).map(Number) ?? [];
+      const w = vb[2] > 0 ? vb[2] : 512, h = vb[3] > 0 ? vb[3] : 512;
+      blob = new Blob([text.replace(/<svg(?![^>]*\swidth)/, `<svg width="${w}" height="${h}"`)], { type: 'image/svg+xml' });
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await loadImageEl(url);
+    const iw = img.naturalWidth || 512, ih = img.naturalHeight || 512;
+    const k = Math.min(IMG_GRID / iw, IMG_GRID / ih);
+    const gw = Math.max(32, Math.round(iw * k)), gh = Math.max(32, Math.round(ih * k));
+    const cv = document.createElement('canvas');
+    cv.width = gw; cv.height = gh;
+    const cx = cv.getContext('2d', { willReadFrequently: true })!;
+    cx.drawImage(img, 0, 0, gw, gh);
+    const px = cx.getImageData(0, 0, gw, gh).data;
+    const comp = largestComponent(buildMask(px, gw, gh), gw, gh);
+    let track = 0;
+    for (let i = 0; i < comp.length; i++) track += comp[i];
+    if (!track) return [];
+    thin(comp, gw, gh);
+    simplifySkeleton(comp, gw, gh);
+    // strip branch decorations to the closed core; fall back to plain walk
+    // when nothing loop-like remains (open track or gappy image).
+    const core = Uint8Array.from(comp);
+    let raw: Pt[];
+    if (extractCore(core, gw, gh) >= 64) {
+      const biggest = largestComponent(core, gw, gh, true); // 8-connected: thin diagonals
+      raw = traceLoop(biggest, gw, gh);
+    } else {
+      prune(comp, gw, gh);
+      raw = traceLoop(comp, gw, gh);
+    }
+    if (raw.length < 8) return [];
+    // fit track bbox into canvas with margin
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const [x, y] of raw) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+    const m = 40, s = Math.min((cw - 2 * m) / Math.max(1, x1 - x0), (ch - 2 * m) / Math.max(1, y1 - y0));
+    return raw.map(([x, y]) => [m + (x - x0) * s, m + (y - y0) * s] as Pt);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
 function refreshList() {
   const ts = listTracks();
   els.sel.innerHTML = ts.map((t) => `<option value="${t.id}">${t.name} (${t.centerline.length}pts)</option>`).join('');

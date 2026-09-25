@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { buildMask, extractCore, largestComponent, thin, prune, simplifySkeleton, traceLoop } from '../src/skeleton.ts';
 import { blendSeam, checkpoints, circleCenter, closeLoop, dist, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, sampleArc, sampleLine, segOverlapsExisting, smooth, smoothOpen, validateGeometry, widthAt } from '../src/track.ts';
 
 test('resample evens spacing on fixture square', () => {
@@ -256,4 +257,101 @@ test('segOverlapsExisting: dense raw bridges pass both ways, true crossings caug
   // degenerate inputs never flag
   assert.equal(segOverlapsExisting(committed, [[0, 0], [1, 1]], w), false);
   assert.equal(segOverlapsExisting([], sampleLine([0, 0], [0, 100]), w), false);
+});
+
+test('skeleton: ring mask thins to a clean loop', () => {
+  const W = 60, H = 60;
+  const data = new Uint8ClampedArray(W * H * 4);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const d = Math.hypot(x - 29.5, y - 29.5);
+      const on = d > 17 && d < 23 ? 255 : 0; // 6px thick ring
+      const i = (y * W + x) * 4;
+      data[i] = data[i + 1] = data[i + 2] = on;
+      data[i + 3] = 255;
+    }
+  }
+  const mask = largestComponent(buildMask(data, W, H), W, H);
+  thin(mask, W, H);
+  simplifySkeleton(mask, W, H);
+  prune(mask, W, H);
+  let count = 0, baddeg = 0;
+  const deg = (i: number) => {
+    const x = i % W, y = (i / W) | 0;
+    let c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy) continue;
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < W && ny < H && mask[ny * W + nx]) c++;
+    }
+    return c;
+  };
+  for (let i = 0; i < W * H; i++) if (mask[i]) { count++; if (deg(i) > 2) baddeg++; }
+  assert.ok(count > 50, `skeleton too small: ${count}`);
+  assert.equal(baddeg, 0, 'skeleton has junctions after rail collapse');
+  const loop = traceLoop(mask, W, H);
+  assert.ok(loop.length > count * 0.9, `trace covered ${loop.length}/${count}`);
+  assert.ok(Math.hypot(loop[0][0] - loop[loop.length - 1][0], loop[0][1] - loop[loop.length - 1][1]) < 2, 'loop not closed');
+});
+
+test('skeleton: spur stub pruned, alpha + opaque masks detected', () => {
+  const W = 60, H = 60;
+  const data = new Uint8ClampedArray(W * H * 4);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const d = Math.hypot(x - 29.5, y - 29.5);
+      let on = d > 17 && d < 23 ? 255 : 0;
+      if (y === 29 && x >= 47 && x < 57) on = 255; // 10px spur sticking out
+      const i = (y * W + x) * 4;
+      data[i] = data[i + 1] = data[i + 2] = on;
+      data[i + 3] = 255;
+    }
+  }
+  const mask = largestComponent(buildMask(data, W, H), W, H);
+  thin(mask, W, H);
+  prune(mask, W, H, 12);
+  const loop = traceLoop(mask, W, H);
+  for (const [x, y] of loop) assert.ok(x < 55, `trace followed spur to ${x},${y}`);
+});
+
+test('skeleton: even-width bar simplifies to one rail', () => {
+  const W = 60, H = 20;
+  const mask = new Uint8Array(W * H);
+  for (let y = 5; y < 15; y++) for (let x = 10; x < 50; x++) mask[y * W + x] = 1; // 10px even bar
+  thin(mask, W, H);
+  simplifySkeleton(mask, W, H);
+  let count = 0, bad = 0;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (!mask[y * W + x]) continue;
+    count++;
+    let c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy) continue;
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < W && ny < H && mask[ny * W + nx]) c++;
+    }
+    if (c > 2) bad++;
+  }
+  assert.ok(count >= 30 && count <= 50, `single rail ~40px, got ${count}`);
+  assert.equal(bad, 0, 'rail still double');
+});
+
+test('skeleton: branch decoration stripped to ring, open line returns empty', () => {
+  const W = 40, H = 40;
+  const ring = (): Uint8Array => {
+    const m = new Uint8Array(W * H);
+    for (let a = 0; a < 360; a++) {
+      const t = (a / 360) * Math.PI * 2;
+      m[Math.round(20 + 14 * Math.cos(t)) + Math.round(20 + 14 * Math.sin(t)) * W] = 1;
+    }
+    return m;
+  };
+  const withBranch = ring();
+  for (let x = 35; x < 40; x++) withBranch[20 * W + x] = 1; // outward stalk, attached only at ring x=34
+  assert.ok(extractCore(withBranch, W, H) > 40, 'ring must survive branch stripping');
+  assert.equal(withBranch[20 * W + 39], 0, 'stalk tip must be stripped');
+  assert.equal(withBranch[20 * W + 34], 1, 'ring attachment must survive');
+  const open = new Uint8Array(W * H);
+  for (let x = 5; x < 35; x++) open[20 * W + x] = 1; // open 1px line: no cycle
+  assert.equal(extractCore(open, W, H), 0, 'open line must strip to nothing');
 });
