@@ -28,3 +28,14 @@ export const loadPieces = (): DraftPieces | null => {
     return d;
   } catch { return null; }
 };
+export interface View { s: number; ox: number; oy: number }
+const V = 'rs.v1.view';
+export const saveView = (v: View) => {
+  try { localStorage.setItem(V, JSON.stringify(v)); } catch { /* ignore */ }
+};
+export const loadView = (): View | null => {
+  try {
+    const d = JSON.parse(localStorage.getItem(V) || 'null');
+    return d && isFinite(d.s) && isFinite(d.ox) && isFinite(d.oy) ? d : null;
+  } catch { return null; }
+};

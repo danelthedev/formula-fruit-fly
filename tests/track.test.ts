@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { blendSeam, bridgeGap, checkpoints, circleCenter, closeLoop, edges, gateAt, hasSelfIntersection, minSelfSeparation, resample, sampleArc, sampleLine, smooth, smoothOpen, validateGeometry, widthAt } from '../src/track.ts';
+import { blendSeam, checkpoints, circleCenter, closeLoop, dist, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, resample, sampleArc, sampleLine, segOverlapsExisting, smooth, smoothOpen, validateGeometry, widthAt } from '../src/track.ts';
 
 test('resample evens spacing on fixture square', () => {
   const sq = [[0, 0], [100, 0], [100, 100], [0, 100]];
@@ -79,13 +79,11 @@ test('overlap guard: out-and-back flagged, clean oval passes', () => {
   assert.ok(minSelfSeparation(oval, 16, true) > 60);
 });
 
-test('bridgeGap closes near-miss, ignores wide gaps; smoothOpen keeps endpoints', () => {
+test('no auto-close: near-miss stays open, exact join closes; smoothOpen keeps endpoints', () => {
   const near: [number, number][] = [[0, 0], [100, 0], [100, 100], [10, 100]]; // 10px gap
-  const bridged = bridgeGap(near);
-  assert.ok(closeLoop(bridged).closed);
+  assert.equal(closeLoop(near).closed, false); // user must join explicitly
   const far: [number, number][] = [[0, 0], [100, 0], [100, 100], [400, 400]];
-  assert.equal(bridgeGap(far).length, far.length); // untouched
-  assert.equal(closeLoop(bridgeGap(far)).closed, false);
+  assert.equal(closeLoop(far).closed, false);
   const kink: [number, number][] = [[0, 0], [50, 0], [50, 50], [100, 50]];
   const sm = smoothOpen(kink);
   const d0 = Math.hypot(sm[0][0], sm[0][1]);
@@ -211,4 +209,47 @@ test('closeLoop keeps overlapped track, fills residual chord evenly', () => {
   assert.equal(r2.loop.length, 11); // 6 raw + 5 chord fillers
   const step = Math.hypot(r2.loop[6][0] - r2.loop[5][0], r2.loop[6][1] - r2.loop[5][1]);
   assert.ok(step < 12, `chord fill step ${step.toFixed(1)}px at seam`);
+});
+
+test('gates world-anchor across rebuilds: no save/load drift', () => {
+  // roundtrip the full pipeline 3x like save/load does; gates must not walk
+  const raw: [number, number][] = [];
+  for (let x = 0; x <= 400; x += 8) raw.push([x, 0]);
+  for (let y = 0; y <= 200; y += 8) raw.push([400, y]);
+  for (let x = 400; x >= 0; x -= 8) raw.push([x, 200]);
+  for (let y = 200; y >= 0; y -= 8) raw.push([0, y]);
+  const pipe = (pts: [number, number][]) => {
+    const rs = resample(pts, 8, false);
+    const { loop } = closeLoop(rs);
+    return blendSeam(smooth(loop));
+  };
+  let center = pipe(raw);
+  let fr = 0.3;
+  const w0 = pointAt(center, true, fr);
+  for (let k = 0; k < 3; k++) {
+    const world = pointAt(center, true, fr); // app: world-anchor before rebuild
+    center = pipe(center);
+    fr = nearestIndex(center, world) / center.length; // re-snap
+  }
+  const w1 = pointAt(center, true, fr);
+  assert.ok(Math.hypot(w1[0] - w0[0], w1[1] - w0[1]) < 8, 'gate walked across save/loads');
+});
+
+test('segOverlapsExisting: dense raw bridges pass both ways, true crossings caught', () => {
+  // regresses the red-green join bug: point-count exclusion zones assumed 8px
+  // spacing, but live hand strokes are ~3px — the attach dot alone tripped red.
+  // exclusion is now world-space around the stroke's own ends: direction-free.
+  const committed: [number, number][] = [];
+  for (let x = 0; x <= 300; x += 3) committed.push([x, 0]);
+  for (let y = 3; y <= 300; y += 3) committed.push([300, y]);
+  const w = 20;
+  const head = committed[0], tail = committed[committed.length - 1];
+  assert.ok(dist(head, tail) > 400, 'fixture needs a real gap');
+  assert.equal(segOverlapsExisting(committed, sampleLine(tail, head), w), false);
+  assert.equal(segOverlapsExisting(committed, sampleLine(head, tail), w), false);
+  // a genuine mid-track crossing is still flagged
+  assert.equal(segOverlapsExisting(committed, sampleLine([150, 80], [150, -80]), w), true);
+  // degenerate inputs never flag
+  assert.equal(segOverlapsExisting(committed, [[0, 0], [1, 1]], w), false);
+  assert.equal(segOverlapsExisting([], sampleLine([0, 0], [0, 100]), w), false);
 });

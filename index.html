@@ -17,7 +17,6 @@
       <aside id="panel">
         <section>
           <h2>History</h2>
-          <p class="hint">Drag on canvas to draw. Release near start to close. Self-crossing strokes are rejected.</p>
           <div class="row">
             <button id="btn-undo">Undo</button>
             <button id="btn-redo">Redo</button>
@@ -33,13 +32,12 @@
             <button id="btn-tool-erase">Erase</button>
             <button id="btn-tool-gate">Checkpoint</button>
           </div>
-          <p class="hint">Draw halves from the glowing dots — ends snap and merge. Erase cuts sections out.</p>
         </section>
         <section>
           <h2>Road</h2>
           <label>Width <input id="in-width" type="range" min="20" max="120" value="60" /> <span id="width-val">60</span></label>
           <div class="row">
-            <button id="btn-start">Set start: off</button>
+            <button id="btn-start">Set start</button>
           </div>
           <div id="gate-editor" hidden>
             <h2 id="gate-title">Checkpoint</h2>

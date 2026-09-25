@@ -37,11 +37,24 @@ export function resample(pts: Pt[], step = 8, closed = true): Pt[] {
   return out;
 }
 
-// Chaikin smoothing (cyclic), keeps shape, kills jitter
+// Chaikin smoothing (cyclic), keeps shape, kills jitter.
+// Skips already-smooth loops: re-smoothing every pass shrinks the track a little
+// each time (gates/track visibly creep across save/loads). Fixed point = stable.
 export function smooth(pts: Pt[], iters = 2): Pt[] {
+  if (!pts.length) return [];
+  const n = pts.length;
+  const p0 = pts[0]; // pinned every iter: index-0 geography must not walk
+  let mt = 0;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n], c = pts[(i + 2) % n];
+    const v0 = [b[0] - a[0], b[1] - a[1]], v1 = [c[0] - b[0], c[1] - b[1]];
+    const l0 = Math.hypot(v0[0], v0[1]) || 1, l1 = Math.hypot(v1[0], v1[1]) || 1;
+    mt = Math.max(mt, Math.abs(Math.atan2(v0[0] * v1[1] - v0[1] * v1[0], v0[0] * v1[0] + v0[1] * v1[1])));
+  }
+  if (mt < 0.12) return resample(pts, 8, true); // ~7°: already smooth, even spacing only
   let cur = pts;
   for (let it = 0; it < iters; it++) {
-    const out: Pt[] = [];
+    const out: Pt[] = [p0];
     for (let i = 0; i < cur.length; i++) {
       const p = cur[i], q = cur[(i + 1) % cur.length];
       out.push([p[0] * 0.75 + q[0] * 0.25, p[1] * 0.75 + q[1] * 0.25]);
@@ -80,6 +93,13 @@ export function closeLoop(pts: Pt[], snap = 60): { loop: Pt[]; closed: boolean }
 export function blendSeam(loop: Pt[], cut = 4): Pt[] {
   const n = loop.length;
   if (n < 16) return loop;
+  // already smooth? skip the cut: re-cutting walks index 0 every pass
+  // (gate fractions are index-relative, so the seam must sit still).
+  const v0 = [loop[1][0] - loop[0][0], loop[1][1] - loop[0][1]];
+  const v1 = [loop[0][0] - loop[n - 1][0], loop[0][1] - loop[n - 1][1]];
+  const l0 = Math.hypot(v0[0], v0[1]) || 1, l1 = Math.hypot(v1[0], v1[1]) || 1;
+  const ang = Math.acos(Math.max(-1, Math.min(1, (v0[0] * v1[0] + v0[1] * v1[1]) / (l0 * l1))));
+  if (ang < 0.2) return resample(loop, 8, true); // ~11°: even spacing only
   const c = Math.max(2, Math.min(cut, Math.floor(n / 8)));
   const A = loop[(n - c) % n], B = loop[c % n];
   const pA = loop[(n - c - 3 + n) % n], nB = loop[(c + 3) % n]; // wide stencil: stable tangents
@@ -188,17 +208,22 @@ export function validateGeometry(center: Pt[], _w: number): 'ok' | 'crossed' {
   return hasSelfIntersection(center) ? 'crossed' : 'ok';
 }
 
-// Min distance between two point sets; skipTail ignores the last N of `a`
-// (used live: new stroke continues where committed path ends).
-export function minSetDist(a: Pt[], b: Pt[], skipTail = 0): number {
-  let m = Infinity;
-  const n = a.length - skipTail;
-  for (let i = 0; i < n; i++)
-    for (let j = 0; j < b.length; j++) {
-      const dd = dist(a[i], b[j]);
-      if (dd < m) m = dd;
+// Does a new stroke overlap committed track? Ignores committed points within
+// r = w*1.5 of the stroke's own ends (attach dot + landing zone), so legit
+// joins pass regardless of point density. Point-count skips are NOT density-proof:
+// raw hand strokes are ~3px spaced, so skipping N points only excludes ~3N px.
+// Returns true when any middle part of the stroke comes within w of the track.
+export function segOverlapsExisting(committed: Pt[], seg: Pt[], w: number): boolean {
+  if (seg.length < 4 || !committed.length) return false;
+  const r = w * 1.5;
+  const a = seg[0], b = seg[seg.length - 1];
+  for (const q of committed) {
+    if (dist(q, a) < r || dist(q, b) < r) continue;
+    for (const p of seg) {
+      if (dist(q, p) < w) return true;
     }
-  return m;
+  }
+  return false;
 }
 
 // Manual checkpoints: gates live exactly on the road edges (left[f]-right[f],
@@ -239,6 +264,17 @@ export function widthAt(t: Track, fr: number): number {
   if (tt < 0) tt += 1;
   const s = 0.5 - 0.5 * Math.cos(Math.PI * Math.min(1, Math.max(0, tt / span)));
   return w0 + (w1 - w0) * s;
+}
+
+// Point on a centerline at arc fraction (open-safe). Used to world-anchor gates
+// and start across rebuilds: fractions alone drift when resampling changes indices.
+export function pointAt(center: Pt[], closed: boolean, fr: number): Pt {
+  const n = center.length;
+  if (!n) return [0, 0];
+  const f = (((fr % 1) + 1) % 1) * n;
+  const i = Math.floor(f) % n, r = f - Math.floor(f);
+  const j = closed ? (i + 1) % n : Math.min(i + 1, n - 1);
+  return [center[i][0] + (center[j][0] - center[i][0]) * r, center[i][1] + (center[j][1] - center[i][1]) * r];
 }
 
 // Edge polylines (clamped indices: correct for open drafts too).
@@ -333,22 +369,6 @@ export function smoothOpen(pts: Pt[], iters = 1): Pt[] {
     cur = out;
   }
   return resample(cur, 8, false);
-}
-
-// Bridge a near-miss end-to-start gap so almost-closed loops still close.
-// Leaves wide gaps alone (genuinely unfinished).
-export function bridgeGap(pts: Pt[], maxGap = 120, step = 8): Pt[] {
-  if (pts.length < 2) return pts;
-  const a = pts[0], b = pts[pts.length - 1];
-  const gap = dist(a, b);
-  if (gap < 1e-6 || gap > maxGap) return pts;
-  const n = Math.max(1, Math.ceil(gap / step));
-  const out = pts.slice();
-  for (let i = 1; i <= n; i++) {
-    const tt = i / (n + 1);
-    out.push([b[0] + (a[0] - b[0]) * tt, b[1] + (a[1] - b[1]) * tt]);
-  }
-  return out;
 }
 
 export function nearestIndex(pts: Pt[], p: Pt): number {

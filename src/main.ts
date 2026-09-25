@@ -1,6 +1,6 @@
-import { blendSeam, bridgeGap, checkpoints, closeLoop, dist, edges, gateAt, minSetDist, nearestIndex, resample, ribbon, sampleArc, sampleLine, seamPatch, smooth, smoothOpen, uid, validateGeometry } from './track';
+import { blendSeam, checkpoints, closeLoop, dist, edges, gateAt, nearestIndex, pointAt, resample, ribbon, sampleArc, sampleLine, seamPatch, segOverlapsExisting, smooth, smoothOpen, uid, validateGeometry } from './track';
 import type { Pt, Track } from './track';
-import { deleteTrack, listTracks, loadDraft, loadPieces, saveDraft, savePieces, saveTrack } from './storage';
+import { deleteTrack, listTracks, loadDraft, loadPieces, loadView, saveDraft, savePieces, saveTrack, saveView } from './storage';
 
 // Model: disjoint pieces (stroke chains). Active piece feeds the track pipeline.
 // New strokes magnetically snap to endpoints; free ends auto-merge with other
@@ -16,16 +16,19 @@ function gid(id: string): HTMLElement {
   return e;
 }
 
-const SNAP = 40;    // endpoint magnet radius — joining halves feels magnetic
-const ERASE_R = 24;
+const SNAP = 40;    // endpoint magnet radius, screen px (divided by zoom at use)
+const ERASE_R = 24; // eraser radius, screen px
+let view = loadView() ?? { s: 1, ox: 0, oy: 0 }; // zoom/pan: screen = world*s + o
 
 let pieces: Pt[][] = [];
 let active = 0;
-interface Snap { pieces: Pt[][]; gates: number[]; widths: number[]; general: number }
+interface Snap { pieces: Pt[][]; gates: number[]; widths: number[]; general: number; start: number }
 let history: Snap[] = [];
 let hIndex = -1;
 let track: Track | null = null;
 let tool: 'free' | 'line' | 'arc' | 'erase' | 'gate' = 'free';
+let panning = false;
+let panLast: [number, number] | null = null;
 let setStartMode = false;
 let drawing: Pt[] | null = null;
 let attachEnd: 'head' | 'tail' | 'new' = 'new';
@@ -70,6 +73,7 @@ function capture(): Snap {
     gates: track?.gates.slice() ?? [],
     widths: track?.gateWidths?.slice() ?? [],
     general: track?.width ?? 60,
+    start: track?.startS ?? 0,
   };
 }
 function pushHistory() {
@@ -80,10 +84,10 @@ function pushHistory() {
 }
 // gates/widths riding along a pieces restore (undo/redo/reject): rebuildTrack picks
 // these up instead of the live track's, since the live track is about to be replaced.
-let incoming: { gates: number[]; widths: number[] } | null = null;
+let incoming: { gates: number[]; widths: number[]; start: number } | null = null;
 function applySnap(s: Snap) {
   pieces = clonePieces(s.pieces); fixActive();
-  incoming = { gates: s.gates.slice(), widths: s.widths.slice() };
+  incoming = { gates: s.gates.slice(), widths: s.widths.slice(), start: s.start };
   els.width.value = String(s.general); els.widthVal.textContent = String(s.general);
   selectedGate = null;
 }
@@ -92,7 +96,7 @@ function applySnap(s: Snap) {
 function buildFromPiece(piece: Pt[]): { center: Pt[]; closed: boolean } | null {
   if (piece.length < 2) return null;
   const rs = resample(piece, 8, false);
-  const { loop, closed } = closeLoop(bridgeGap(rs)); // near-miss gaps auto-bridged
+  const { loop, closed } = closeLoop(rs); // no auto-bridge: only explicit joins close
   if (!closed) return { center: smoothOpen(loop), closed };
   return { center: blendSeam(smooth(loop)), closed }; // seam corner cut + G1 bridge
 }
@@ -106,9 +110,23 @@ function rebuildTrack(keepStart = true): boolean {
   const built = buildFromPiece(pieces[active]);
   if (!built || built.center.length < 2) { track = null; persist(); render(); return true; }
   const w = Number(els.width.value);
-  const prevGates = incoming?.gates ?? track?.gates ?? [];
-  const prevWidths = incoming?.widths ?? track?.gateWidths ?? prevGates.map(() => track?.width ?? w);
-  incoming = null;
+  // gates/start ride along as geography, not indices: resampling shifts indices
+  // every pass (gates used to walk ~30px per save/load). Undo restores verbatim.
+  const prevCenter = track?.centerline, hadCenter = !!prevCenter && prevCenter.length >= 2;
+  const prevClosed = track?.closed ?? false;
+  const startWorld = hadCenter ? pointAt(prevCenter!, prevClosed, (track!.startS % prevCenter!.length) / prevCenter!.length) : null;
+  const gateWorld = hadCenter ? (track?.gates ?? []).map((fr) => pointAt(prevCenter!, prevClosed, fr)) : [];
+  let gates: number[], widths: number[], startS: number;
+  if (incoming) {
+    ({ gates, widths } = incoming);
+    startS = incoming.start;
+    incoming = null;
+  } else {
+    gates = gateWorld.map((p) => nearestIndex(built.center, p) / built.center.length);
+    widths = (track?.gateWidths ?? []).slice(0, gates.length);
+    while (widths.length < gates.length) widths.push(w);
+    startS = startWorld ? nearestIndex(built.center, startWorld) : keepStart ? (track?.startS ?? 0) : 0;
+  }
   if (built.closed && validateGeometry(built.center, w) === 'crossed') {
     applySnap(history[hIndex]);
     rebuildTrack(); // rebuild last-good: deterministic, always succeeds
@@ -124,10 +142,10 @@ function rebuildTrack(keepStart = true): boolean {
   track = {
     id: prev?.id ?? uid(), name: prev?.name ?? '',
     centerline: built.center, width: w,
-    startS: keepStart ? (prev?.startS ?? 0) : 0,
+    startS: Math.min(startS, built.center.length - 1),
     closed: built.closed,
-    gates: prevGates, // manual gates are fractions: survive geometry rebuilds
-    gateWidths: prevWidths,
+    gates, // world-anchored fractions
+    gateWidths: widths,
   };
   if (track.startS >= built.center.length) track.startS = 0;
   persist(); render();
@@ -150,7 +168,7 @@ function endpoints(): Ep[] {
   return out;
 }
 function snapToEndpoint(p: Pt): Ep | null {
-  let best: Ep | null = null, bd = SNAP;
+  let best: Ep | null = null, bd = SNAP / view.s; // screen-constant magnet
   for (const e of endpoints()) {
     const d = dist(p, e.p);
     if (d < bd) { bd = d; best = e; }
@@ -176,33 +194,53 @@ function tryMerge(freeAtHead: boolean): boolean {
   }
   return false;
 }
-function addStroke(seg: Pt[], attach: 'head' | 'tail' | 'new') {
+function addStroke(seg: Pt[], attach: 'head' | 'tail' | 'new', label = 'Stroke') {
   if (seg.length < 2) return;
+  if (strokeOverlaps(seg)) { say(`Too close to existing track — ${label.toLowerCase()} rejected.`); render(); return; }
   if (attach === 'new') { pieces.push(seg); active = pieces.length - 1; }
   else if (attach === 'tail') pieces[active].push(...seg.slice(1));
   else pieces[active].unshift(...seg.slice(1).reverse());
   tryMerge(attach === 'head');
+  // explicit closure only: free end drawn onto the opposite end joins exactly.
+  // (no invented bridge segments — the data ring is truly closed)
+  const A = pieces[active];
+  if (A.length > 30 && dist(A[0], A[A.length - 1]) < SNAP / view.s) {
+    if (attach === 'head') A[0] = [...A[A.length - 1]] as Pt;
+    else A[A.length - 1] = [...A[0]] as Pt;
+  }
   commit();
-  if (track?.closed) say(`Loop closed (${track.centerline.length} pts) — set the start line.`);
+  if (track?.closed && (tool === 'free' || tool === 'line' || tool === 'arc')) {
+    setTool('gate'); // closed → next job is checkpoints
+    say(`Loop closed (${track.centerline.length} pts) — place checkpoints or set the start line.`);
+  } else if (track?.closed) say(`Loop closed (${track.centerline.length} pts) — set the start line.`);
 }
 
 // ---- eraser: drag to delete points within radius (splits pieces) ----
+// Cutting a closed loop rotates the runs so BOTH dots land on the cut:
+// [head..cutA] + [cutB..tail] becomes one piece [cutB..tail, head..cutA].
 function eraseAt(p: Pt): boolean {
-  let changed = false;
+  const r = ERASE_R / view.s;
   const before = allRaw().length;
+  const wasClosed = track?.closed ?? false;
   const out: Pt[][] = [];
-  for (const pc of pieces) {
+  pieces.forEach((pc, pi) => {
+    const runs: Pt[][] = [];
     let run: Pt[] = [];
     for (const q of pc) {
-      if (dist(q, p) > ERASE_R) run.push(q);
-      else { if (run.length >= 2) out.push(run); run = []; }
+      if (dist(q, p) > r) run.push(q);
+      else { if (run.length >= 2) runs.push(run); run = []; }
     }
-    if (run.length >= 2) out.push(run);
-  }
+    if (run.length >= 2) runs.push(run);
+    if (runs.length === 2 && pi === active && wasClosed) out.push([...runs[1], ...runs[0]]);
+    else out.push(...runs);
+  });
   const after = out.flat().length;
-  changed = after !== before;
-  if (changed) { pieces = out; fixActive(); rebuildTrack(); }
-  return changed;
+  if (after === before) return false;
+  pieces = out;
+  active = 0;
+  pieces.forEach((pc, i) => { if (pc.length > pieces[active].length) active = i; });
+  fixActive(); rebuildTrack();
+  return true;
 }
 
 // ---- pointer ----
@@ -216,11 +254,19 @@ const els = {
   file: gid('file-import') as HTMLInputElement,
 };
 const pos = (e: PointerEvent): Pt => {
-  // scale client px -> canvas backing px (fixes offset when CSS scales the canvas)
+  // scale client px -> canvas backing px -> world (inverse view)
   const r = canvas.getBoundingClientRect();
-  return [(e.clientX - r.left) * (canvas.width / r.width), (e.clientY - r.top) * (canvas.height / r.height)];
+  const kx = canvas.width / r.width;
+  return [((e.clientX - r.left) * kx - view.ox) / view.s, ((e.clientY - r.top) * kx - view.oy) / view.s];
 };
 canvas.addEventListener('pointerdown', (e) => {
+  if (e.button === 1) { // wheel-click pan (any tool, even start-armed)
+    panning = true; panLast = [e.clientX, e.clientY];
+    canvas.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    return;
+  }
+  if (e.button === 2 && tool !== 'gate') return; // right-click is gate-select only
   canvas.setPointerCapture(e.pointerId);
   const p = pos(e);
   if (setStartMode) { // start-pick mode: only job is placing the start line
@@ -233,8 +279,14 @@ canvas.addEventListener('pointerdown', (e) => {
     return;
   }
   if (tool === 'erase') { erasing = true; eraseChanged = false; if (eraseAt(p)) eraseChanged = true; return; }
-  if (tool === 'gate') { toggleGate(p); return; }
+  if (tool === 'gate') {
+    if (e.button === 2) selectGateAt(p);
+    else if (!track?.closed) say('Close the loop first, then place checkpoints.');
+    else addGateAt(p);
+    return;
+  }
   if (tool === 'arc') {
+    if (track?.closed) { say('Track is closed — erase a section to edit it.'); return; }
     const s = snapToEndpoint(p);
     if (arcPts.length === 0) {
       if (pieces.length && !s) { say('Start arcs from a glowing dot.'); return; }
@@ -244,10 +296,11 @@ canvas.addEventListener('pointerdown', (e) => {
     if (arcPts.length === 3) {
       const seg = sampleArc(arcPts[0], arcPts[1], arcPts[2]);
       arcPts = []; hover = null;
-      addStroke(attachEnd === 'new' ? seg : [seg[0], ...seg.slice(1)], attachEnd);
+      addStroke(seg, attachEnd, 'Arc');
     } else { say(`Arc: click point ${arcPts.length + 1} of 3 (Esc cancels)`); render(); }
     return;
   }
+  if (track?.closed) { say('Track is closed — erase a section to edit it.'); return; }
   if (pieces.length) {
     const s = snapToEndpoint(p);
     if (!s) { say('Start from a glowing dot to extend the circuit.'); return; }
@@ -259,27 +312,35 @@ canvas.addEventListener('pointerdown', (e) => {
   drawing = [start];
 });
 canvas.addEventListener('pointermove', (e) => {
+  if (panning && panLast) { // wheel-drag pan
+    const kx = canvas.width / canvas.getBoundingClientRect().width;
+    view.ox += (e.clientX - panLast[0]) * kx;
+    view.oy += (e.clientY - panLast[1]) * kx;
+    panLast = [e.clientX, e.clientY];
+    saveView(view); render();
+    return;
+  }
   hover = pos(e);
   if (tool === 'arc' && arcPts.length > 0) { render(); return; }
+  if (tool === 'gate') { render(); return; } // ghost gate follows cursor
   if (tool === 'erase') { render(); if (erasing && eraseAt(hover)) eraseChanged = true; return; }
   if (!drawing) return;
   const p = hover;
   if (tool === 'line' && lineStart) {
     const s = snapToEndpoint(p); // magnetic line ends: precise joins
-    drawing = [lineStart, s ? [...s.p] as Pt : p];
+    drawing = sampleLine(lineStart, s ? [...s.p] as Pt : p); // full sampling: preview == commit
     renderLive();
     return;
   }
   if (dist(p, drawing[drawing.length - 1]) > 3) { drawing.push(p); renderLive(); }
 });
 canvas.addEventListener('pointerup', (e) => {
+  if (panning) { panning = false; panLast = null; return; }
   if (erasing) { erasing = false; if (eraseChanged) { pushHistory(); say('Erased.'); } return; }
   if (tool === 'line' && lineStart) {
-    const end = pos(e);
-    const s = snapToEndpoint(end);
-    const seg = sampleLine(lineStart, s ? [...s.p] as Pt : end);
+    const seg = drawing ?? [];
     lineStart = null; drawing = null;
-    addStroke(seg, attachEnd);
+    addStroke(seg, attachEnd, 'Line');
     return;
   }
   if (!drawing) return;
@@ -288,13 +349,36 @@ canvas.addEventListener('pointerup', (e) => {
   drawing = null;
 });
 window.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !(e.target as HTMLElement)?.closest?.('input,select,textarea')) {
+    e.preventDefault();
+    if (e.shiftKey) { if (hIndex < history.length - 1) { hIndex++; applySnap(history[hIndex]); rebuildTrack(); say('Redo'); } }
+    else if (hIndex > 0) { hIndex--; applySnap(history[hIndex]); rebuildTrack(); say('Undo'); }
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); document.getElementById('btn-redo')?.click(); return; }
   if (e.key === 'Escape' && setStartMode) { setArmed(false); say('Start placement cancelled'); return; }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && !(e.target as HTMLElement)?.closest?.('input,select,textarea')) {
+    if (selectedGate !== null) { e.preventDefault(); removeSelectedGate(); return; }
+  }
   if (e.key === 'Escape' && arcPts.length) { arcPts = []; hover = null; render(); say('Arc cancelled'); }
 });
 canvas.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   if (arcPts.length) { arcPts = []; hover = null; render(); say('Arc cancelled'); }
 });
+// scroll zoom to cursor (0.25x–4x), persisted
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect(), kx = canvas.width / r.width;
+  const mx = (e.clientX - r.left) * kx, my = (e.clientY - r.top) * kx;
+  const ns = Math.min(4, Math.max(0.25, view.s * Math.exp(-e.deltaY * 0.0015)));
+  view.ox = mx - ((mx - view.ox) * ns) / view.s;
+  view.oy = my - ((my - view.oy) * ns) / view.s;
+  view.s = ns;
+  saveView(view); render();
+}, { passive: false });
+// middle-click would autoscroll: suppress it
+canvas.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
 
 // ---- render ----
 // Smooth-stroke paths: midpoint quadratics render curves without facets,
@@ -323,15 +407,15 @@ function pathOf(pts: Pt[], close: boolean) {
     ctx.lineTo(l[0], l[1]);
   }
 }
-// live: does the in-progress stroke overlap existing track?
+// live: does a stroke overlap committed track? Delegates to the density-proof
+// check in track.ts (exclusion in world px around the stroke's own ends).
+// Red = invalid: placement is blocked.
+function strokeOverlaps(seg: Pt[]): boolean {
+  if (!pieces.length) return false;
+  return segOverlapsExisting(allRaw(), seg, Number(els.width.value));
+}
 function liveOverlap(): boolean {
-  if (!drawing || drawing.length < 4 || !pieces.length) return false;
-  const w = Number(els.width.value);
-  const committed = allRaw();
-  const skip = Math.ceil(w / 3);
-  const mid = committed.slice(skip, committed.length - skip);
-  if (mid.length === 0) return false;
-  return minSetDist(mid, drawing) < w;
+  return drawing ? strokeOverlaps(drawing) : false;
 }
 function renderLive() {
   render();
@@ -342,7 +426,9 @@ function renderLive() {
   if (bad) say('Too close to existing track — leave a full track-width gap.');
 }
 function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(view.s, 0, 0, view.s, view.ox, view.oy);
   // pieces: inactive dim, active brighter
   pieces.forEach((pc, i) => {
     ctx.strokeStyle = i === active ? '#777' : '#4a4a4a'; ctx.lineWidth = 1;
@@ -394,16 +480,32 @@ function render() {
     ctx.fillStyle = '#ff0';
     for (const p of arcPts) { ctx.beginPath(); ctx.arc(p[0], p[1], 4, 0, Math.PI * 2); ctx.fill(); }
     if (arcPts.length === 2 && hover) {
-      ctx.strokeStyle = '#ff0'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
-      pathOf(sampleArc(arcPts[0], arcPts[1], hover), false); ctx.stroke(); ctx.setLineDash([]);
+      const ps = snapToEndpoint(hover); // same snap as commit: preview == verdict
+      const prev = sampleArc(arcPts[0], arcPts[1], ps ? [...ps.p] as Pt : hover);
+      const bad = strokeOverlaps(prev);
+      ctx.strokeStyle = bad ? '#f44' : '#ff0'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+      pathOf(prev, false); ctx.stroke(); ctx.setLineDash([]);
     }
+  }
+  // ghost gate: where a click would place it
+  if (tool === 'gate' && hover && track?.closed && track.centerline.length >= 8) {
+    const g = gateAt(track, nearestIndex(track.centerline, hover) / track.centerline.length);
+    ctx.strokeStyle = '#666'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(g.a[0], g.a[1]); ctx.lineTo(g.b[0], g.b[1]); ctx.stroke(); ctx.setLineDash([]);
   }
   // eraser cursor
   if (tool === 'erase' && hover) {
     ctx.strokeStyle = '#f44'; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.arc(hover[0], hover[1], ERASE_R, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(hover[0], hover[1], ERASE_R / view.s, 0, Math.PI * 2); ctx.stroke();
   }
-  syncGateEditor(); validate();
+  syncGateEditor();
+  const locked = track?.closed ?? false; // drawing tools sleep while the loop is closed
+  const gateOff = !locked; // checkpoint tool needs a complete circuit
+  for (const [id, off] of [['btn-tool-free', locked], ['btn-tool-line', locked], ['btn-tool-arc', locked], ['btn-tool-gate', gateOff]] as const) {
+    const b = document.getElementById(id);
+    if (b && (b as HTMLButtonElement).disabled !== off) (b as HTMLButtonElement).disabled = off;
+  }
+  validate();
 }
 
 function validate() {
@@ -448,7 +550,7 @@ els.width.onchange = () => pushHistory(); // one undo step per drag, not per tic
 function setArmed(on: boolean) {
   if (on && (!track || !track.closed)) { say('Draw a closed loop first'); return; }
   setStartMode = on;
-  els.start.textContent = on ? 'Set start: ON — click the track' : 'Set start: off';
+  els.start.classList.toggle('active', on);
   document.querySelectorAll('#panel button, #panel input, #panel select').forEach((el) => {
     if (el.id !== 'btn-start') (el as HTMLButtonElement).disabled = on;
   });
@@ -460,30 +562,46 @@ els.start.onclick = () => setArmed(!setStartMode);
 // Manual checkpoints: click road to add (general width), click gate to select,
 // click selected gate to deselect. Selected gate edits width / removes below.
 let selectedGate: number | null = null;
-function toggleGate(p: Pt) {
-  if (!track || !track.closed || track.centerline.length < 8) { say('Close the loop first, then place checkpoints.'); return; }
-  const dseg = (g: { a: Pt; b: Pt }): number => {
-    const vx = g.b[0] - g.a[0], vy = g.b[1] - g.a[1], L2 = vx * vx + vy * vy || 1;
-    const tt = Math.max(0, Math.min(1, ((p[0] - g.a[0]) * vx + (p[1] - g.a[1]) * vy) / L2));
-    return Math.hypot(p[0] - (g.a[0] + vx * tt), p[1] - (g.a[1] + vy * tt));
-  };
-  let bi = -1, bd = 14;
-  checkpoints(track).forEach((g, i) => { const d = dseg(g); if (d < bd) { bd = d; bi = i; } });
+// left-click: place a gate. right-click: select. Delete key: remove selected.
+function gateDist(p: Pt, g: { a: Pt; b: Pt }): number {
+  const vx = g.b[0] - g.a[0], vy = g.b[1] - g.a[1], L2 = vx * vx + vy * vy || 1;
+  const tt = Math.max(0, Math.min(1, ((p[0] - g.a[0]) * vx + (p[1] - g.a[1]) * vy) / L2));
+  return Math.hypot(p[0] - (g.a[0] + vx * tt), p[1] - (g.a[1] + vy * tt));
+}
+function nearestGate(p: Pt): number {
+  if (!track) return -1;
+  let bi = -1, bd = 20 / view.s;
+  checkpoints(track).forEach((g, i) => { const d = gateDist(p, g); if (d < bd) { bd = d; bi = i; } });
+  return bi;
+}
+function addGateAt(p: Pt) {
+  if (!track) return;
   track.gateWidths ??= track.gates.map(() => track!.width);
-  if (bi >= 0) {
-    selectedGate = selectedGate === bi ? null : bi;
-    say(selectedGate === null ? 'Checkpoint deselected' : `Checkpoint ${bi + 1} selected — set its width below`);
-  } else {
-    const fr = nearestIndex(track.centerline, p) / track.centerline.length;
-    track.gates.push(fr);
-    track.gateWidths.push(track.width);
-    const order = track.gates.map((g, i) => i).sort((a, b) => track!.gates[a] - track!.gates[b]);
-    track.gates = order.map((i) => track!.gates[i]);
-    track.gateWidths = order.map((i) => track!.gateWidths![i]);
-    selectedGate = track.gates.indexOf(fr);
-    say(`Checkpoint ${track.gates.length} placed at width ${track.width}`);
-  }
+  if (nearestGate(p) >= 0) { say('Checkpoint already here — right-click it to select'); return; }
+  const fr = nearestIndex(track.centerline, p) / track.centerline.length;
+  track.gates.push(fr);
+  track.gateWidths.push(track.width);
+  const order = track.gates.map((g, i) => i).sort((a, b) => track!.gates[a] - track!.gates[b]);
+  track.gates = order.map((i) => track!.gates[i]);
+  track.gateWidths = order.map((i) => track!.gateWidths![i]);
+  selectedGate = track.gates.indexOf(fr);
+  say(`Checkpoint ${track.gates.length} placed at width ${track.width}`);
   pushHistory(); syncGateEditor(); persist(); render();
+}
+function selectGateAt(p: Pt) {
+  if (!track) return;
+  const bi = nearestGate(p);
+  selectedGate = bi >= 0 && selectedGate !== bi ? bi : null;
+  say(selectedGate === null ? 'Checkpoint deselected' : `Checkpoint ${selectedGate + 1} selected — set its width below`);
+  syncGateEditor(); render();
+}
+function removeSelectedGate() {
+  if (!track || selectedGate === null || selectedGate >= track.gates.length) return;
+  track.gates.splice(selectedGate, 1);
+  track.gateWidths?.splice(selectedGate, 1);
+  selectedGate = null;
+  say(`Checkpoint removed (${track.gates.length} left)`);
+  pushHistory(); persist(); render();
 }
 // gate editor panel (Road section): width of selected gate + remove
 function syncGateEditor() {
@@ -497,6 +615,7 @@ function syncGateEditor() {
 }
 const setTool = (t: typeof tool) => {
   if (setStartMode) return; // locked while start-pick is armed
+  if (track?.closed && (t === 'free' || t === 'line' || t === 'arc')) return; // locked while closed
   tool = t; arcPts = []; hover = null; lineStart = null; drawing = null; erasing = false;
   for (const [id, tt] of [['btn-tool-free', 'free'], ['btn-tool-line', 'line'], ['btn-tool-arc', 'arc'], ['btn-tool-erase', 'erase'], ['btn-tool-gate', 'gate']] as const)
     document.getElementById(id)?.classList.toggle('active', tt === t);
@@ -504,7 +623,7 @@ const setTool = (t: typeof tool) => {
   say(t === 'free' ? 'Free: drag from a glowing dot to extend, or start fresh'
     : t === 'line' ? 'Line: drag; both ends snap to dots'
     : t === 'arc' ? 'Arc: click 3 points (start, via, end)'
-    : t === 'gate' ? 'Checkpoints: click road to add, click gate to select + size'
+    : t === 'gate' ? 'Checkpoints: left-click road to add, right-click gate to select (Del removes)'
     : 'Erase: drag over track to delete sections');
   syncGateEditor(); render();
 };
@@ -522,14 +641,7 @@ gid('btn-tool-gate').onclick = () => setTool('gate');
   }
 };
 (gid('in-gate-width') as HTMLInputElement).onchange = () => pushHistory();
-gid('btn-gate-remove').onclick = () => {
-  if (!track || selectedGate === null) return;
-  track.gates.splice(selectedGate, 1);
-  track.gateWidths?.splice(selectedGate, 1);
-  selectedGate = null;
-  say(`Checkpoint removed (${track.gates.length} left)`);
-  pushHistory(); persist(); render();
-};
+gid('btn-gate-remove').onclick = () => removeSelectedGate();
 els.save.onclick = () => {
   if (!track || track.centerline.length < 8) { say('Draw a valid loop first'); return; }
   track.name = els.name.value.trim() || `Track ${new Date().toLocaleString()}`;
@@ -584,10 +696,12 @@ function fitCanvas() {
   if (w !== canvas.width || h !== canvas.height) {
     const sx = w / spaceW, sy = h / spaceH; // 1.0 when reopening at same window: no-op
     spaceW = w; spaceH = h;
+    view.ox *= sx; view.oy *= sy; // pan follows the resize
     if (sx !== 1 || sy !== 1) {
       const sc = (ps: Pt[][]) => { for (const pc of ps) for (const p of pc) { p[0] *= sx; p[1] *= sy; } };
       sc(pieces);
       for (const hs of history) sc(hs.pieces);
+      if (track) for (const p of track.centerline) { p[0] *= sx; p[1] *= sy; } // keep prev-center in post-scale space for world-anchoring
       drawing = null; lineStart = null; hover = null;
     }
     canvas.width = w; canvas.height = h;
