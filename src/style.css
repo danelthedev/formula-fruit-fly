@@ -20,14 +20,15 @@ main[hidden] { display: none; }
 #view-teams { flex: 1; min-height: 0; overflow-y: auto; background: none; border: none; padding: 12px; }
 #view-teams[hidden] { display: none; }
 .teams-wrap { display: flex; gap: 12px; align-items: start; max-width: 900px; margin: 0 auto; }
-.teams-wrap > section { flex: 1; min-width: 0; }
+.teams-wrap > section, .teams-wrap > .teams-col { flex: 1; min-width: 0; }
+.teams-col { display: flex; flex-direction: column; gap: 12px; }
 #team-list { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-#team-list li { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 6px; background: #222; }
+#team-list li { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 6px; background: #222; cursor: pointer; }
 #team-list li.sel { outline: 1px solid #0af; }
 #team-list .swatch { width: 18px; height: 18px; border-radius: 4px; border: 1px solid #555; flex: none; }
 #team-list .tname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #team-list .tspecs { color: #aaa; font-size: 12px; }
-#team-preview { background: #222; border: 1px solid #444; border-radius: 8px; }
+#team-preview { background: #222; border: 1px solid #444; border-radius: 8px; width: 100%; height: auto; display: block; }
 #view-teams input[type=color] { width: 44px; height: 28px; padding: 2px; background: #2a2a2a; border: 1px solid #555; border-radius: 6px; }
 main { flex: 1; min-height: 0; display: flex; gap: 12px; padding: 12px; }
 #editor { flex: 1 1 auto; min-width: 0; min-height: 0; width: 100%; height: 100%; background: #222; border: 1px solid #444; border-radius: 8px; cursor: crosshair; touch-action: none; }

@@ -804,7 +804,7 @@ function showView(v: MainView) {
   if (ph) gid('placeholder-title').textContent = 'Races'; // only races still parked here
   (Object.entries({ 'nav-tracks': 'tracks', 'nav-teams': 'teams', 'nav-races': 'races' }) as [string, MainView][])
     .forEach(([id, vv]) => gid(id).classList.toggle('active', vv === v));
-  say(v === 'tracks' ? '' : v === 'teams' ? `${teams.length} team${teams.length === 1 ? '' : 's'} — training needs at least 1.` : 'Page under construction — check back later.');
+  say(v === 'races' ? 'Page under construction — check back later.' : '');
 }
 gid('nav-tracks').onclick = () => showView('tracks');
 gid('nav-teams').onclick = () => showView('teams');
@@ -846,25 +846,32 @@ function renderTeams() {
     const sp = document.createElement('span');
     sp.className = 'tspecs';
     sp.textContent = `${t.topSpeed}/${t.acceleration}/${t.brakeEfficiency}/${t.turningAbility}`;
-    const b = document.createElement('button');
-    b.textContent = 'Edit';
-    b.onclick = () => { editingId = t.id; renderTeams(); };
-    li.append(sw, nm, sp, b);
+    li.onclick = () => { editingId = editingId === t.id ? null : t.id; renderTeams(); }; // toggle: deselect returns to a blank new-team form
+    li.append(sw, nm, sp);
     ul.appendChild(li);
   });
   const ed = editingId ? teams.find((t) => t.id === editingId) : null;
-  const f = ed ?? blankTeam('');
-  (gid('in-team-name') as HTMLInputElement).value = f.name;
-  (gid('in-team-primary') as HTMLInputElement).value = f.primary;
-  (gid('in-team-secondary') as HTMLInputElement).value = f.secondary;
-  for (const k of SPECS) (gid(`in-spec-${k}`) as HTMLInputElement).value = String(f[k]);
-  gid('team-form-title').textContent = ed ? `Edit team` : 'New team';
-  (gid('btn-team-del') as HTMLButtonElement).disabled = !ed;
+  (gid('team-editor') as HTMLElement).hidden = !ed;
+  (gid('team-preview-card') as HTMLElement).hidden = !ed;
   gid('teams-hint').textContent = teams.length ? '' : 'Create at least 1 team to unlock training.';
+  if (!ed) return;
+  (gid('in-team-name') as HTMLInputElement).value = ed.name;
+  (gid('in-team-primary') as HTMLInputElement).value = ed.primary;
+  (gid('in-team-secondary') as HTMLInputElement).value = ed.secondary;
+  for (const k of SPECS) (gid(`in-spec-${k}`) as HTMLInputElement).value = String(ed[k]);
+  gid('team-form-title').textContent = 'Edit team';
+  (gid('btn-team-del') as HTMLButtonElement).disabled = false;
   paintPreview();
 }
-gid('btn-team-new').onclick = () => { editingId = null; renderTeams(); };
-gid('btn-team-cancel').onclick = () => { editingId = null; renderTeams(); };
+gid('btn-team-new').onclick = async () => {
+  let n = teams.length + 1;
+  while (teams.some((t) => t.name.toLowerCase() === `team ${n}`)) n++;
+  const t = { ...blankTeam(uid()), name: `Team ${n}` };
+  teams.push(t); editingId = t.id;
+  await saveTeams(teams);
+  renderTeams();
+};
+gid('btn-team-cancel').onclick = () => { renderTeams(); }; // revert unsaved edits for the selected team
 gid('btn-team-save').onclick = async () => {
   const f = formTeam();
   const errs = teamErrors(f.name, editingId ?? '', teams);

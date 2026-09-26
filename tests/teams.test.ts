@@ -36,6 +36,8 @@ test('drawCarPreview paints body color without throwing (stub ctx)', () => {
     beginPath: () => { calls.push('b'); }, closePath: () => {},
     moveTo: () => {}, lineTo: () => {}, fill: () => { calls.push('f'); },
     ellipse: () => {},
+    stroke: () => {},
+    set lineWidth(_v: number) {},
     roundRect: (_x: number, _y: number, _w: number, _h: number, _r: number) => {},
     set fillStyle(_v: string) {},
   } as unknown as CanvasRenderingContext2D;

@@ -89,6 +89,7 @@
     </main>
     <section id="view-teams" hidden>
       <div class="teams-wrap">
+        <div class="teams-col">
         <section>
           <h2>Teams</h2>
           <ul id="team-list"></ul>
@@ -102,7 +103,12 @@
           </div>
           <p class="hint" id="teams-hint"></p>
         </section>
-        <section>
+        <section id="team-preview-card" hidden>
+          <h2>Preview</h2>
+          <canvas id="team-preview" width="440" height="330"></canvas>
+        </section>
+        </div>
+        <section id="team-editor" hidden>
           <h2 id="team-form-title">New team</h2>
           <label>Name <input id="in-team-name" maxlength="40" placeholder="Team name" /></label>
           <label>Primary <input id="in-team-primary" type="color" value="#e10600" /></label>
@@ -111,7 +117,6 @@
           <label>Acceleration <input id="in-spec-acceleration" type="range" min="1" max="10" value="5" /> <span id="spec-acceleration-val">5</span></label>
           <label>Braking <input id="in-spec-brakeEfficiency" type="range" min="1" max="10" value="5" /> <span id="spec-brakeEfficiency-val">5</span></label>
           <label>Turning <input id="in-spec-turningAbility" type="range" min="1" max="10" value="5" /> <span id="spec-turningAbility-val">5</span></label>
-          <canvas id="team-preview" width="220" height="110"></canvas>
           <div class="row">
             <button id="btn-team-save">Save team</button>
             <button id="btn-team-cancel">Cancel</button>
