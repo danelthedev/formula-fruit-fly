@@ -371,17 +371,19 @@ export function edges(t: Track): { left: Pt[]; right: Pt[] } {
     left.push([c[0] + nx * fL[i], c[1] + ny * fL[i]]);
     right.push([c[0] - nx * fR[i], c[1] - ny * fR[i]]);
   }
-  // final pass: smooth the polylines themselves. Center jitter steers the per-vertex
-  // normals, and the ±hw lever turns degrees of wobble into px of lumpy road.
-  // (cusp clamp above already ran; this only irons high-frequency ripples.)
+  // final pass: iron single-vertex ripples (±1 only). A wider window rounds
+  // rendered corners far beyond the centerline (imported circuits came out
+  // feathered). Center jitter steers the per-vertex normals, and the ±hw
+  // lever turns degrees of wobble into px of lumpy road — ±1 kills the
+  // worst of it while keeping corners. (Cusp clamp above already ran.)
   const sm = (poly: Pt[]): Pt[] =>
     poly.map((_, i) => {
       let x = 0, y = 0;
-      for (let m = -3; m <= 3; m++) {
+      for (let m = -1; m <= 1; m++) {
         const q = poly[t.closed ? ((i + m + n) % n) : Math.max(0, Math.min(n - 1, i + m))];
         x += q[0]; y += q[1];
       }
-      return [x / 7, y / 7] as Pt;
+      return [x / 3, y / 3] as Pt;
     });
   return { left: sm(left), right: sm(right) };
 }
