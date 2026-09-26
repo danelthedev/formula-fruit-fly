@@ -1,5 +1,5 @@
 import { buildMask, extractCore, largestComponent, prune, simplifySkeleton, thin, traceLoop } from './skeleton';
-import { blendSeam, checkpoints, closeLoop, dist, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, sampleArc, sampleLine, seamPatch, segOverlapsExisting, smooth, smoothOpen, uid, validateGeometry } from './track';
+import { blendSeam, checkpoints, closeLoop, dist, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths } from './track';
 import type { Pt, Track } from './track';
 import { deleteTrack, listTracks, loadDraft, loadPieces, loadView, saveDraft, savePieces, saveTrack, saveView } from './storage';
 
@@ -116,7 +116,7 @@ function rebuildTrack(keepStart = true): boolean {
     // Strokes unchanged: reuse the stored centerline verbatim. Reprocessing clean
     // data is pure loss (resample renumbering, trim/fill flicker) and is what made
     // gates creep across saves. Only metadata can have changed.
-    track.width = w;
+    track.width = w; pinOpenWidth();
     persist(); render(); return true;
   }
   const built = buildFromPiece(pieces[active]);
@@ -159,7 +159,9 @@ function rebuildTrack(keepStart = true): boolean {
     gateWidths: widths,
   };
   if (track.startS >= built.center.length) track.startS = 0;
+  pinOpenWidth();
   builtFor = { v: piecesVersion, active };
+  refreshWidthCaps();
   persist(); render();
   return true;
 }
@@ -208,7 +210,7 @@ function tryMerge(freeAtHead: boolean): boolean {
 }
 function addStroke(seg: Pt[], attach: 'head' | 'tail' | 'new', label = 'Stroke') {
   if (seg.length < 2) return;
-  if (strokeOverlaps(seg)) { say(`Too close to existing track — ${label.toLowerCase()} rejected.`); render(); return; }
+  if (strokeOverlaps(seg)) { say(`Overlap — ${label.toLowerCase()} rejected. Leave a full track-width gap.`); render(); return; }
   if (attach === 'new') { pieces.push(seg); active = pieces.length - 1; }
   else if (attach === 'tail') pieces[active].push(...seg.slice(1));
   else pieces[active].unshift(...seg.slice(1).reverse());
@@ -423,11 +425,78 @@ function pathOf(pts: Pt[], close: boolean) {
 // check in track.ts (exclusion in world px around the stroke's own ends).
 // Red = invalid: placement is blocked.
 function strokeOverlaps(seg: Pt[]): boolean {
+  const w = Number(els.width.value);
+  if (selfStrokeOverlaps(seg, w)) return true; // fold inside this stroke (incl. first)
   if (!pieces.length) return false;
-  return segOverlapsExisting(allRaw(), seg, Number(els.width.value));
+  return segOverlapsExisting(allRaw(), seg, w);
 }
 function liveOverlap(): boolean {
   return drawing ? strokeOverlaps(drawing) : false;
+}
+
+// ---- width caps: sliders stop where the ribbon would self-overlap ----
+// Same threshold as the draw guard (center distance < summed half-widths),
+// but against the finished centerline with the live width profile.
+const sepWin = (closed: boolean) => (closed ? 16 : 10);
+function overlapsAt(general: number, gateWidths: number[]): boolean {
+  if (!track || track.centerline.length < 8) return false;
+  const t: Track = { ...track, width: general, gates: track.gates, gateWidths };
+  return ribbonSelfOverlap(t.centerline, vertexWidths(t), t.closed, sepWin(t.closed));
+}
+// untouched gates (within 0.5 of general) follow the general slider; customized stay
+function followerWidths(general: number, newW: number, widths: number[]): number[] {
+  const out = widths.slice();
+  track?.gates.forEach((_, i) => { if (Math.abs((out[i] ?? general) - general) < 0.5) out[i] = newW; });
+  return out;
+}
+// max v in [lo,hi] that doesn't overlap; null when even lo overlaps (legacy blob)
+function maxClean(lo: number, hi: number, bad: (v: number) => boolean): number | null {
+  if (bad(lo)) return null;
+  if (!bad(hi)) return hi;
+  let ok = lo, ng = hi;
+  while (ng - ok > 1) { const m = (ok + ng) >> 1; if (bad(m)) ng = m; else ok = m; }
+  return ok;
+}
+// Clamp slider maxes AND values so widths can't grow into (or sit in) overlap.
+// Null (overlap even at 20px): legacy blob — leave the value, freeze the max.
+function refreshWidthCaps() {
+  if (!track) return;
+  const base = track.gateWidths ?? track.gates.map(() => track!.width);
+  const g = maxClean(20, 120, (v) => overlapsAt(v, followerWidths(track!.width, v, base)));
+  if (g !== null && g < track.width) {
+    // geometry changed under the slider (e.g. loop just closed): shrink to the cap
+    const oldW = track.width;
+    track.width = g;
+    els.width.value = String(g); els.widthVal.textContent = String(g);
+    track.gateWidths = followerWidths(oldW, g, track.gateWidths ?? track.gates.map(() => oldW));
+    say(`Road narrowed to ${g}px — wider would overlap the track.`);
+  }
+  if (track.gateWidths) {
+    track.gateWidths.forEach((gw, i) => {
+      if (i >= track!.gates.length) return;
+      const cap = maxClean(20, 160, (v) => { const c = track!.gateWidths!.slice(); c[i] = v; return overlapsAt(track!.width, c); });
+      if (cap !== null && cap < gw) {
+        track!.gateWidths![i] = cap;
+        say(`Checkpoint ${i + 1} narrowed to ${cap}px — wider would overlap the track.`);
+      }
+    });
+  }
+  const gMax = maxClean(20, 120, (v) => overlapsAt(v, followerWidths(track!.width, v, track!.gateWidths ?? []))) ?? track.width;
+  els.width.max = String(Math.max(gMax, track.width));
+  if (selectedGate !== null && track.gateWidths && selectedGate < track.gates.length) {
+    const gw = track.gateWidths;
+    const cap = maxClean(20, 160, (v) => { const c = gw.slice(); c[selectedGate!] = v; return overlapsAt(track!.width, c); }) ?? gw[selectedGate];
+    (gid('in-gate-width') as HTMLInputElement).max = String(Math.max(cap, gw[selectedGate]));
+  }
+}
+
+// Open drafts always ride at 20px: the width slider is locked until close,
+// so there is never a stale too-big value to force-reduce afterwards.
+function pinOpenWidth() {
+  if (track && !track.closed && track.width !== 20) {
+    track.width = 20;
+    els.width.value = '20'; els.widthVal.textContent = '20';
+  }
 }
 function renderLive() {
   render();
@@ -435,7 +504,7 @@ function renderLive() {
   const bad = liveOverlap();
   ctx.strokeStyle = bad ? '#f44' : '#ff0'; ctx.lineWidth = bad ? 3 : 2; ctx.setLineDash([6, 4]);
   pathOf(drawing, false); ctx.stroke(); ctx.setLineDash([]);
-  if (bad) say('Too close to existing track — leave a full track-width gap.');
+  if (bad) say('Overlap — leave a full track-width gap.');
 }
 function render() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -513,6 +582,8 @@ function render() {
   syncGateEditor();
   const locked = track?.closed ?? false; // drawing tools sleep while the loop is closed
   const gateOff = !locked; // checkpoint tool needs a complete circuit
+  els.width.disabled = !locked; // road width unlocks once the loop is closed (open drafts ride at 20px)
+  (els.start as HTMLButtonElement).disabled = !locked; // start line needs a built circuit
   for (const [id, off] of [['btn-tool-free', locked], ['btn-tool-line', locked], ['btn-tool-arc', locked], ['btn-tool-gate', gateOff]] as const) {
     const b = document.getElementById(id);
     if (b && (b as HTMLButtonElement).disabled !== off) (b as HTMLButtonElement).disabled = off;
@@ -545,15 +616,22 @@ els.redo.onclick = () => {
   applySnap(history[hIndex]);
   rebuildTrack(); say('Redo');
 };
-els.clear.onclick = () => { pieces = []; active = 0; arcPts = []; hover = null; selectedGate = null; touchPieces(); commit(); say('Cleared'); };
+els.clear.onclick = () => { pieces = []; active = 0; arcPts = []; hover = null; selectedGate = null; els.width.value = '20'; els.widthVal.textContent = '20'; touchPieces(); commit(); say('Cleared'); };
 els.width.oninput = () => {
-  els.widthVal.textContent = els.width.value;
-  // untouched gates (still at the old general width) follow the slider; customized stay
   if (track) {
-    const oldW = track.width, newW = Number(els.width.value);
-    track.gateWidths ??= track.gates.map(() => oldW);
-    track.gates.forEach((_, i) => { if (Math.abs((track!.gateWidths?.[i] ?? oldW) - oldW) < 0.5) track!.gateWidths![i] = newW; });
+    const oldW = track.width, wantW = Number(els.width.value);
+    const base = track.gateWidths ?? track.gates.map(() => oldW);
+    if (overlapsAt(wantW, followerWidths(oldW, wantW, base))) {
+      const cap = maxClean(20, wantW, (v) => overlapsAt(v, followerWidths(oldW, v, base))) ?? Math.min(oldW, wantW);
+      els.width.value = String(cap);
+      say(`Width capped at ${cap}px — wider would overlap the track.`);
+    }
+    // untouched gates (still at the old general width) follow the slider; customized stay
+    const oldW2 = track.width, newW = Number(els.width.value);
+    track.gateWidths ??= track.gates.map(() => oldW2);
+    track.gates.forEach((_, i) => { if (Math.abs((track!.gateWidths?.[i] ?? oldW2) - oldW2) < 0.5) track!.gateWidths![i] = newW; });
   }
+  els.widthVal.textContent = els.width.value;
   rebuildTrack();
 };
 els.width.onchange = () => pushHistory(); // one undo step per drag, not per tick
@@ -598,14 +676,14 @@ function addGateAt(p: Pt) {
   track.gateWidths = order.map((i) => track!.gateWidths![i]);
   selectedGate = track.gates.indexOf(fr);
   say(`Checkpoint ${track.gates.length} placed at width ${track.width}`);
-  pushHistory(); syncGateEditor(); persist(); render();
+  pushHistory(); refreshWidthCaps(); syncGateEditor(); persist(); render();
 }
 function selectGateAt(p: Pt) {
   if (!track) return;
   const bi = nearestGate(p);
   selectedGate = bi >= 0 && selectedGate !== bi ? bi : null;
   say(selectedGate === null ? 'Checkpoint deselected' : `Checkpoint ${selectedGate + 1} selected — set its width below`);
-  syncGateEditor(); render();
+  refreshWidthCaps(); syncGateEditor(); render();
 }
 function removeSelectedGate() {
   if (!track || selectedGate === null || selectedGate >= track.gates.length) return;
@@ -613,7 +691,7 @@ function removeSelectedGate() {
   track.gateWidths?.splice(selectedGate, 1);
   selectedGate = null;
   say(`Checkpoint removed (${track.gates.length} left)`);
-  pushHistory(); persist(); render();
+  pushHistory(); refreshWidthCaps(); persist(); render();
 }
 // gate editor panel (Road section): width of selected gate + remove
 function syncGateEditor() {
@@ -645,12 +723,20 @@ gid('btn-tool-arc').onclick = () => setTool('arc');
 gid('btn-tool-erase').onclick = () => setTool('erase');
 gid('btn-tool-gate').onclick = () => setTool('gate');
 (gid('in-gate-width') as HTMLInputElement).oninput = (e) => {
-  const v = Number((e.target as HTMLInputElement).value);
-  gid('gate-width-val').textContent = String(v);
-  if (track && selectedGate !== null && track.gateWidths) {
+  const input = e.target as HTMLInputElement;
+  let v = Number(input.value);
+  if (track && selectedGate !== null && track.gateWidths && selectedGate < track.gates.length) {
+    const cur = track.gateWidths[selectedGate] ?? track.width;
+    const cand = track.gateWidths.slice(); cand[selectedGate] = v;
+    if (overlapsAt(track.width, cand)) {
+      v = maxClean(20, v, (w) => { const c = track!.gateWidths!.slice(); c[selectedGate!] = w; return overlapsAt(track!.width, c); }) ?? Math.min(cur, v);
+      input.value = String(v);
+      say(`Checkpoint width capped at ${v}px — wider would overlap the track.`);
+    }
     track.gateWidths[selectedGate] = v;
-    persist(); render();
+    persist(); refreshWidthCaps(); render();
   }
+  gid('gate-width-val').textContent = String(v);
 };
 (gid('in-gate-width') as HTMLInputElement).onchange = () => pushHistory();
 gid('btn-gate-remove').onclick = () => removeSelectedGate();
@@ -669,7 +755,7 @@ els.load.onclick = () => {
   touchPieces();
   builtFor = { v: piecesVersion, active }; // verbatim: saved centerline needs no reprocessing
   els.width.value = String(t.width); els.widthVal.textContent = String(t.width);
-  pushHistory(); persist(); render(); say(`Loaded "${t.name}"`);
+  pushHistory(); pinOpenWidth(); refreshWidthCaps(); persist(); render(); say(`Loaded "${t.name}"`);
 };
 els.del.onclick = () => { if (els.sel.value) { deleteTrack(els.sel.value); refreshList(); say('Deleted'); } };
 els.exp.onclick = () => {
@@ -692,7 +778,7 @@ els.file.onchange = async () => {
     pieces = [track.centerline.map((p) => [...p] as Pt)]; active = 0; selectedGate = null;
     touchPieces();
     builtFor = { v: piecesVersion, active }; // verbatim: no reprocessing
-    pushHistory(); refreshList(); say(`Imported (${track.centerline.length} pts)`);
+    pushHistory(); pinOpenWidth(); refreshWidthCaps(); refreshList(); say(`Imported (${track.centerline.length} pts)`);
   } catch { say('Import failed: invalid track JSON'); }
   els.file.value = '';
 };
@@ -705,7 +791,15 @@ gid('btn-import-img').onclick = () => gid('file-image').click();
     say('Tracing image…');
     const loop = await traceImageFile(f, canvas.width, canvas.height);
     if (loop.length < 8) { say('No track found — need one-color circuit on plain background.'); return; }
+    // auto-clear: drop the doodle, its gates/start and tool state, and bump the
+    // pieces version — without touchPieces the rebuild below reuses the old
+    // centerline and the import never appears.
     pieces = [loop]; active = 0; selectedGate = null;
+    arcPts = []; hover = null; lineStart = null; drawing = null;
+    track = null;
+    touchPieces();
+    els.width.value = '60'; els.widthVal.textContent = '60'; // fresh closed track: standard default (caps still apply)
+    view = { s: 1, ox: 0, oy: 0 }; saveView(view); // traced loop is fit to canvas px: identity view shows it
     commit(); say(`Traced ${loop.length} pts — set width, checkpoints, start.`);
   } catch { say('Image import failed.'); }
 };
@@ -808,8 +902,10 @@ new ResizeObserver(() => { window.clearTimeout(fitT); fitT = window.setTimeout(f
 // restore slider state from draft before first rebuild (else width snaps to default)
 {
   const d = loadDraft();
-  if (d) {
+  if (d?.closed) {
     els.width.value = String(d.width); els.widthVal.textContent = String(d.width);
+  } else {
+    els.width.value = '20'; els.widthVal.textContent = '20'; // no built circuit yet
   }
 }
 fitCanvas();

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildMask, extractCore, largestComponent, thin, prune, simplifySkeleton, traceLoop } from '../src/skeleton.ts';
-import { blendSeam, checkpoints, circleCenter, closeLoop, dist, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, sampleArc, sampleLine, segOverlapsExisting, smooth, smoothOpen, validateGeometry, widthAt } from '../src/track.ts';
+import { blendSeam, checkpoints, circleCenter, closeLoop, dist, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, ribbonSelfOverlap, sampleArc, sampleLine, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, validateGeometry, vertexWidths, widthAt } from '../src/track.ts';
 
 test('resample evens spacing on fixture square', () => {
   const sq = [[0, 0], [100, 0], [100, 100], [0, 100]];
@@ -354,4 +354,44 @@ test('skeleton: branch decoration stripped to ring, open line returns empty', ()
   const open = new Uint8Array(W * H);
   for (let x = 5; x < 35; x++) open[20 * W + x] = 1; // open 1px line: no cycle
   assert.equal(extractCore(open, W, H), 0, 'open line must strip to nothing');
+});
+
+test('ribbonSelfOverlap flags parallel collision, passes oval; vertexWidths follows profile', () => {
+  const pts: [number, number][] = [];
+  for (let x = 0; x <= 200; x += 8) pts.push([x, 0]);
+  for (let x = 200; x >= 0; x -= 8) pts.push([x, 20]); // 20px parallel
+  const wide = new Array(pts.length).fill(30); // W=60 halves
+  assert.equal(ribbonSelfOverlap(pts, wide, false, 10), true);
+  const narrow = new Array(pts.length).fill(5); // W=10 halves
+  assert.equal(ribbonSelfOverlap(pts, narrow, false, 10), false);
+  // variable widths: dist 20 < 15+15, but not < 5+5
+  const mixed = narrow.slice(); mixed[0] = 15; mixed[51] = 15; // (0,0) vs (0,20) across the pair
+  assert.equal(ribbonSelfOverlap(pts, mixed, false, 10), true);
+  const oval = Array.from({ length: 120 }, (_, i) => {
+    const a = (i / 120) * Math.PI * 2;
+    return [Math.cos(a) * 200, Math.sin(a) * 120] as [number, number];
+  });
+  assert.equal(ribbonSelfOverlap(oval, new Array(120).fill(30), true, 16), false); // W=60 clean
+  const t = { id: 'x', name: 'x', centerline: oval, width: 60, startS: 0, closed: true, gates: [] as number[] };
+  assert.ok(vertexWidths(t).every((w) => w === 30));
+  const g = { ...t, gates: [0.2], gateWidths: [44] };
+  assert.ok(vertexWidths(g).every((w) => w === 22)); // single gate: constant profile
+});
+
+test('selfStrokeOverlaps flags mid-stroke folds, passes lines, arcs and loop closure', () => {
+  const line: [number, number][] = [];
+  for (let x = 0; x <= 300; x += 8) line.push([x, 0]);
+  assert.equal(selfStrokeOverlaps(line, 60), false);
+  // out 200px, back 20px parallel: fold with plenty of arc outside the end zones
+  const fold: [number, number][] = [];
+  for (let x = 0; x <= 200; x += 8) fold.push([x, 0]);
+  for (let x = 200; x >= 0; x -= 8) fold.push([x, 20]);
+  assert.equal(selfStrokeOverlaps(fold, 60), true);
+  assert.equal(selfStrokeOverlaps(fold, 10), false); // 20px gap clean at W=10
+  // loop closure: ends meet, middle far — legal
+  const loop: [number, number][] = [];
+  for (let a = 0; a <= 40; a++) loop.push([100 + 100 * Math.cos((a / 40) * Math.PI * 2), 100 * Math.sin((a / 40) * Math.PI * 2)]);
+  assert.equal(selfStrokeOverlaps(loop, 60), false);
+  assert.equal(selfStrokeOverlaps([[0, 0], [10, 0]], 60), false); // too short
+  assert.equal(selfStrokeOverlaps(line, 0), false);
 });

@@ -184,6 +184,32 @@ export function minSelfSeparation(pts: Pt[], window: number, closed: boolean): n
   return m;
 }
 
+// Per-vertex half-widths under the live width profile (general + gate interpolation).
+export function vertexWidths(t: Track): number[] {
+  const n = t.centerline.length;
+  return t.centerline.map((_, i) => widthAt(t, i / n) / 2);
+}
+
+// Ribbon self-overlap with variable widths: non-adjacent centerlines collide
+// when closer than the sum of their half-widths. Same index-window convention
+// as minSelfSeparation (16 closed / 10 open at the call site).
+export function ribbonSelfOverlap(center: Pt[], halfs: number[], closed: boolean, window: number): boolean {
+  const n = center.length;
+  if (n < window * 2 + 4 || halfs.length < n) return false;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      let d = j - i;
+      if (closed) d = Math.min(d, n - d);
+      if (d <= window) continue;
+      const a = center[i], b = center[j];
+      const dx = a[0] - b[0], dy = a[1] - b[1];
+      const r = halfs[i] + halfs[j];
+      if (dx * dx + dy * dy < r * r) return true;
+    }
+  }
+  return false;
+}
+
 // Geometry policy: centerline crossings rejected; ribbon overlaps MERGE
 // (tight angles become hairpins — the union renders as wider apex asphalt).
 export function validateGeometry(center: Pt[], _w: number): 'ok' | 'crossed' {
@@ -204,6 +230,28 @@ export function segOverlapsExisting(committed: Pt[], seg: Pt[], w: number): bool
     if (dist(q, a) < r || dist(q, b) < r) continue;
     for (const p of seg) {
       if (dist(q, p) < w) return true;
+    }
+  }
+  return false;
+}
+
+// Self-overlap within one stroke (the first stroke has no committed track yet, so
+// the guard above can't see it). Pairs nearer than w*1.5 arc-length to either
+// end are skipped — world-space like the end exclusion above, so loop closure
+// and attach joints stay legal regardless of point density.
+export function selfStrokeOverlaps(seg: Pt[], w: number): boolean {
+  const n = seg.length;
+  if (n < 4 || !(w > 0)) return false;
+  const s: number[] = [0];
+  for (let i = 1; i < n; i++) s.push(s[i - 1] + dist(seg[i - 1], seg[i]));
+  const total = s[n - 1], m = w * 1.5;
+  if (total < m * 2) return false;
+  for (let i = 0; i < n; i++) {
+    if (s[i] < m) continue; // near head: attach/closure zone
+    for (let j = i + 1; j < n; j++) {
+      if (s[j] - s[i] < m) continue; // same section along track
+      if (total - s[j] < m) continue; // near tail: attach/closure zone
+      if (dist(seg[i], seg[j]) < w) return true;
     }
   }
   return false;
