@@ -1,5 +1,6 @@
 export type Pt = [number, number];
 export interface Checkpoint { s: number; a: Pt; b: Pt; }
+export interface TrackBg { data: string; x: number; y: number; s: number } // underlay image (transport + file only; editor state lives in storage)
 export interface Track {
   id: string; name: string;
   centerline: Pt[]; // resampled, closed (first==last omitted; treated cyclically)
@@ -8,6 +9,7 @@ export interface Track {
   closed: boolean;  // loop auto-closed (end snapped to start)
   gates: number[];  // manual checkpoints, arc fractions [0,1) sorted along travel
   gateWidths?: number[]; // parallel to gates; missing entries fall back to width
+  bg?: TrackBg | null; // optional background underlay (JSON round-trip only)
 }
 
 export const dist = (a: Pt, b: Pt) => Math.hypot(a[0] - b[0], a[1] - b[1]);

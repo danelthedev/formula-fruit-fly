@@ -1,7 +1,7 @@
 import { buildMask, extractCore, largestComponent, prune, simplifySkeleton, thin, traceLoop } from './skeleton';
 import { blendSeam, checkpoints, closeLoop, dist, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths } from './track';
 import type { Pt, Track } from './track';
-import { deleteTrack, listTracks, loadDraft, loadPieces, loadView, saveDraft, savePieces, saveTrack, saveView } from './storage';
+import { deleteTrack, listTracks, loadBg, loadDraft, loadPieces, loadView, ready as storeReady, saveBg, saveDraft, savePieces, saveTrack, saveView } from './storage';
 
 // Model: disjoint pieces (stroke chains). Active piece feeds the track pipeline.
 // New strokes magnetically snap to endpoints; free ends auto-merge with other
@@ -19,7 +19,7 @@ function gid(id: string): HTMLElement {
 
 const SNAP = 40;    // endpoint magnet radius, screen px (divided by zoom at use)
 const ERASE_R = 24; // eraser radius, screen px
-let view = loadView() ?? { s: 1, ox: 0, oy: 0 }; // zoom/pan: screen = world*s + o
+let view = { s: 1, ox: 0, oy: 0 }; // zoom/pan: screen = world*s + o (restored in boot)
 
 let pieces: Pt[][] = [];
 let active = 0;
@@ -40,16 +40,30 @@ let lineStart: Pt | null = null;
 let arcPts: Pt[] = [];
 let hover: Pt | null = null;
 let erasing = false;
+
+// Background image: world-space offset/scale, drawn under everything.
+let bg: { img: HTMLImageElement; data: string; x: number; y: number; s: number } | null = null;
+let moveBg = false;
+let bgDrag: [number, number] | null = null;
+function saveBgState() {
+  saveBg(bg ? { data: bg.data, x: bg.x, y: bg.y, s: bg.s } : null);
+}
+function setBg(img: HTMLImageElement, data: string, x: number, y: number, s: number) {
+  bg = { img, data, x, y, s };
+  (gid('in-bg-scale') as HTMLInputElement).value = String(Math.round(s * 100));
+  gid('bg-scale-val').textContent = `${Math.round(s * 100)}%`;
+  saveBgState(); render();
+}
 let eraseChanged = false;
 let lastRejection: string | null = null; // shown in checklist so message + requirements agree
 
 const clonePieces = (ps: Pt[][]): Pt[][] => ps.map((s) => s.map((p) => [...p] as Pt));
 const allRaw = (): Pt[] => pieces.flat();
 
-// ---- init ----
-{
-  const saved = loadPieces();
-  const draft = loadDraft();
+// ---- init (async: storage lives in IndexedDB) ----
+async function bootRestore() {
+  const saved = await loadPieces();
+  const draft = await loadDraft();
   if (saved) { pieces = saved.pieces; active = saved.active; }
   else if (draft) { pieces = [draft.centerline.map((p) => [...p] as Pt)]; }
   if (draft?.closed === undefined && draft) (draft as Track).closed = true;
@@ -66,9 +80,12 @@ function fixActive() {
     active = bi;
   }
 }
+// Ordered, non-blocking writes: chained so rapid rebuilds can't persist out of order.
+let pchain: Promise<void> = Promise.resolve();
 function persist() {
-  savePieces({ pieces, active, w: canvas.width, h: canvas.height });
-  saveDraft(track);
+  const pp = { pieces: clonePieces(pieces), active, w: canvas.width, h: canvas.height };
+  const td = track ? { ...track, gates: track.gates.slice(), gateWidths: track.gateWidths?.slice() } : null;
+  pchain = pchain.then(() => Promise.all([savePieces(pp), saveDraft(td)])).then(() => undefined).catch(() => {});
 }
 // snapshots cover pieces + checkpoints + widths: undo spans everything
 function capture(): Snap {
@@ -280,6 +297,11 @@ canvas.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     return;
   }
+  if (moveBg && bg && e.button === 0) { // background move: drag pans the image, never draws
+    bgDrag = [e.clientX, e.clientY];
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
   if (e.button === 2 && tool !== 'gate') return; // right-click is gate-select only
   canvas.setPointerCapture(e.pointerId);
   const p = pos(e);
@@ -334,6 +356,14 @@ canvas.addEventListener('pointermove', (e) => {
     saveView(view); render();
     return;
   }
+  if (bgDrag && bg) { // background move drag: client px -> world
+    const kx = canvas.width / canvas.getBoundingClientRect().width;
+    bg.x += ((e.clientX - bgDrag[0]) * kx) / view.s;
+    bg.y += ((e.clientY - bgDrag[1]) * kx) / view.s;
+    bgDrag = [e.clientX, e.clientY];
+    render();
+    return;
+  }
   hover = pos(e);
   if (tool === 'arc' && arcPts.length > 0) { render(); return; }
   if (tool === 'gate') { render(); return; } // ghost gate follows cursor
@@ -350,6 +380,7 @@ canvas.addEventListener('pointermove', (e) => {
 });
 canvas.addEventListener('pointerup', (e) => {
   if (panning) { panning = false; panLast = null; return; }
+  if (bgDrag) { bgDrag = null; saveBgState(); return; }
   if (erasing) { erasing = false; if (eraseChanged) { pushHistory(); say('Erased.'); } return; }
   if (tool === 'line' && lineStart) {
     const seg = drawing ?? [];
@@ -373,6 +404,17 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && setStartMode) { setArmed(false); say('Start placement cancelled'); return; }
   if ((e.key === 'Delete' || e.key === 'Backspace') && !(e.target as HTMLElement)?.closest?.('input,select,textarea')) {
     if (selectedGate !== null) { e.preventDefault(); removeSelectedGate(); return; }
+  }
+  if (!(e.ctrlKey || e.metaKey) && !(e.target as HTMLElement)?.closest?.('input,select,textarea')) {
+    const k = e.key.toLowerCase();
+    if (k === 'f') setTool('free');
+    else if (k === 'l') setTool('line');
+    else if (k === 'a') setTool('arc');
+    else if (k === 'e') setTool('erase');
+    else if (k === 'c') setTool('gate');
+    else if (k === 's') setArmed(!setStartMode);
+    else return;
+    return;
   }
   if (e.key === 'Escape' && arcPts.length) { arcPts = []; hover = null; render(); say('Arc cancelled'); }
 });
@@ -510,6 +552,7 @@ function render() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.setTransform(view.s, 0, 0, view.s, view.ox, view.oy);
+  if (bg && bg.img.naturalWidth > 0) ctx.drawImage(bg.img, bg.x, bg.y, bg.img.naturalWidth * bg.s, bg.img.naturalHeight * bg.s);
   // pieces: inactive dim, active brighter
   pieces.forEach((pc, i) => {
     ctx.strokeStyle = i === active ? '#777' : '#4a4a4a'; ctx.lineWidth = 1;
@@ -594,12 +637,11 @@ function render() {
 function validate() {
   const items: [boolean, string][] = [];
   const n = track?.centerline.length ?? 0;
-  items.push([(track?.closed ?? false) && n >= 32, `Closed loop (${n} pts)`]);
-  items.push([(track?.width ?? 0) >= 20, `Width ${track?.width ?? '—'}px`]);
+  items.push([(track?.closed ?? false) && n >= 32, 'Closed loop']);
   if (lastRejection) items.push([false, lastRejection]);
-  items.push([(track?.startS ?? -1) >= 0 && n >= 8, 'Start/finish placed']);
+  items.push([(track?.startS ?? -1) >= 0 && n >= 8, 'Start line placed']);
   const ng = track?.gates.length ?? 0;
-  items.push([ng >= 3, `${ng} checkpoints placed (need 3+, Checkpoint tool)`]);
+  items.push([ng >= 3, `${ng}/3 checkpoints`]);
   checks.innerHTML = items.map(([ok, t]) => `<li class="${ok ? 'ok' : 'bad'}">${ok ? '✓' : '✗'} ${t}</li>`).join('');
 }
 
@@ -707,6 +749,7 @@ const setTool = (t: typeof tool) => {
   if (setStartMode) return; // locked while start-pick is armed
   if (track?.closed && (t === 'free' || t === 'line' || t === 'arc')) return; // locked while closed
   tool = t; arcPts = []; hover = null; lineStart = null; drawing = null; erasing = false;
+  if (moveBg) { moveBg = false; gid('btn-bg-move').classList.remove('active'); } // picking a tool ends background move
   for (const [id, tt] of [['btn-tool-free', 'free'], ['btn-tool-line', 'line'], ['btn-tool-arc', 'arc'], ['btn-tool-erase', 'erase'], ['btn-tool-gate', 'gate']] as const)
     document.getElementById(id)?.classList.toggle('active', tt === t);
   canvas.style.cursor = t === 'erase' ? 'cell' : 'crosshair';
@@ -722,6 +765,21 @@ gid('btn-tool-line').onclick = () => setTool('line');
 gid('btn-tool-arc').onclick = () => setTool('arc');
 gid('btn-tool-erase').onclick = () => setTool('erase');
 gid('btn-tool-gate').onclick = () => setTool('gate');
+
+// ---- top-level views: builder vs placeholders ----
+type MainView = 'tracks' | 'teams' | 'races';
+function showView(v: MainView) {
+  const isTracks = v === 'tracks';
+  (gid('view-tracks') as HTMLElement).hidden = !isTracks;
+  (gid('view-placeholder') as HTMLElement).hidden = isTracks;
+  if (!isTracks) gid('placeholder-title').textContent = v === 'teams' ? 'My Teams' : 'Races';
+  (Object.entries({ 'nav-tracks': 'tracks', 'nav-teams': 'teams', 'nav-races': 'races' }) as [string, MainView][])
+    .forEach(([id, vv]) => gid(id).classList.toggle('active', vv === v));
+  say(isTracks ? '' : 'Page under construction — check back later.');
+}
+gid('nav-tracks').onclick = () => showView('tracks');
+gid('nav-teams').onclick = () => showView('teams');
+gid('nav-races').onclick = () => showView('races');
 (gid('in-gate-width') as HTMLInputElement).oninput = (e) => {
   const input = e.target as HTMLInputElement;
   let v = Number(input.value);
@@ -740,13 +798,17 @@ gid('btn-tool-gate').onclick = () => setTool('gate');
 };
 (gid('in-gate-width') as HTMLInputElement).onchange = () => pushHistory();
 gid('btn-gate-remove').onclick = () => removeSelectedGate();
-els.save.onclick = () => {
+els.save.onclick = async () => {
   if (!track || track.centerline.length < 8) { say('Draw a valid loop first'); return; }
   track.name = els.name.value.trim() || `Track ${new Date().toLocaleString()}`;
-  saveTrack(track); refreshList(); say(`Saved "${track.name}"`);
+  try {
+    await saveTrack(bg ? { ...track, bg: { data: bg.data, x: bg.x, y: bg.y, s: bg.s } } : track);
+    await refreshList();
+    say(`Saved "${track.name}"`);
+  } catch { say('Save failed: browser storage is full — remove the background or delete old tracks.'); }
 };
-els.load.onclick = () => {
-  const t = listTracks().find((t) => t.id === els.sel.value);
+els.load.onclick = async () => {
+  const t = (await listTracks()).find((t) => t.id === els.sel.value);
   if (!t || t.centerline.length < 2) return;
   track = { ...t, gates: t.gates ?? [], gateWidths: t.gateWidths ?? (t.gates ?? []).map(() => t.width) };
   track.closed = t.closed ?? dist(track.centerline[0], track.centerline[track.centerline.length - 1]) < 60;
@@ -755,12 +817,16 @@ els.load.onclick = () => {
   touchPieces();
   builtFor = { v: piecesVersion, active }; // verbatim: saved centerline needs no reprocessing
   els.width.value = String(t.width); els.widthVal.textContent = String(t.width);
+  const lb = t.bg;
+  if (lb?.data && [lb.x, lb.y, lb.s].every(isFinite) && lb.s > 0) {
+    loadImageEl(lb.data).then((img) => setBg(img, lb.data, lb.x, lb.y, lb.s)).catch(() => { /* bad image: track still loads */ });
+  } else if (bg) clearBg(); // record has no underlay: don't show the previous track's
   pushHistory(); pinOpenWidth(); refreshWidthCaps(); persist(); render(); say(`Loaded "${t.name}"`);
 };
-els.del.onclick = () => { if (els.sel.value) { deleteTrack(els.sel.value); refreshList(); say('Deleted'); } };
+els.del.onclick = async () => { if (!els.sel.value) return; await deleteTrack(els.sel.value); await refreshList(); say('Deleted'); };
 els.exp.onclick = () => {
   if (!track) { say('Nothing to export'); return; }
-  const blob = new Blob([JSON.stringify(track, null, 2)], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify(bg ? { ...track, bg: { data: bg.data, x: bg.x, y: bg.y, s: bg.s } } : track, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = `${track.name || 'track'}.json`; a.click();
   URL.revokeObjectURL(a.href);
@@ -778,10 +844,66 @@ els.file.onchange = async () => {
     pieces = [track.centerline.map((p) => [...p] as Pt)]; active = 0; selectedGate = null;
     touchPieces();
     builtFor = { v: piecesVersion, active }; // verbatim: no reprocessing
+    const fb = t.bg;
+    if (fb?.data && [fb.x, fb.y, fb.s].every(isFinite) && fb.s > 0) {
+      loadImageEl(fb.data).then((img) => setBg(img, fb.data, fb.x, fb.y, fb.s)).catch(() => { /* bad image: track still loads */ });
+    }
     pushHistory(); pinOpenWidth(); refreshWidthCaps(); refreshList(); say(`Imported (${track.centerline.length} pts)`);
   } catch { say('Import failed: invalid track JSON'); }
   els.file.value = '';
 };
+// ---- background image: underlay for tracing, world-space pan/scale ----
+gid('btn-bg-import').onclick = () => gid('file-bg').click();
+function clearBg() {
+  bg = null; moveBg = false;
+  gid('btn-bg-move').classList.remove('active');
+  (gid('in-bg-scale') as HTMLInputElement).value = '100';
+  gid('bg-scale-val').textContent = '100%';
+  saveBgState();
+}
+gid('btn-bg-remove').onclick = () => { clearBg(); render(); say('Background removed.'); };
+gid('btn-bg-move').onclick = () => {
+  if (!bg) { say('Import a background first.'); return; }
+  moveBg = !moveBg;
+  gid('btn-bg-move').classList.toggle('active', moveBg);
+  canvas.style.cursor = moveBg ? 'move' : 'crosshair';
+  say(moveBg ? 'Drag to move the background (click Move again to draw).' : 'Move off.');
+  render();
+};
+(gid('in-bg-scale') as HTMLInputElement).oninput = (e) => {
+  const v = Number((e.target as HTMLInputElement).value);
+  gid('bg-scale-val').textContent = `${v}%`;
+  if (bg) { bg.s = v / 100; render(); }
+};
+(gid('in-bg-scale') as HTMLInputElement).onchange = () => saveBgState();
+(gid('file-bg') as HTMLInputElement).onchange = async (e) => {
+  const f = (e.target as HTMLInputElement).files?.[0];
+  (e.target as HTMLInputElement).value = '';
+  if (!f) return;
+  try {
+    const url = URL.createObjectURL(f);
+    let img: HTMLImageElement;
+    try { img = await loadImageEl(url); } finally { URL.revokeObjectURL(url); }
+    const iw = img.naturalWidth || 512, ih = img.naturalHeight || 512;
+    // downscale to 1024px for storage; PNG when transparent, else JPEG
+    const k = Math.min(1, 1024 / Math.max(iw, ih));
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(iw * k)); cv.height = Math.max(1, Math.round(ih * k));
+    const cx2 = cv.getContext('2d')!;
+    cx2.drawImage(img, 0, 0, cv.width, cv.height);
+    const px = cx2.getImageData(0, 0, cv.width, cv.height).data;
+    let alpha = false;
+    for (let i = 3; i < px.length; i += 16) if (px[i] < 128) { alpha = true; break; }
+    const data = cv.toDataURL(alpha ? 'image/png' : 'image/jpeg', 0.85);
+    const art = await loadImageEl(data);
+    // fit into the current view, centered (clamped to the scale slider range)
+    const s = Math.min(8, Math.max(0.05, Math.min(canvas.width / art.naturalWidth, canvas.height / art.naturalHeight)));
+    const wx = (canvas.width / 2 - view.ox) / view.s, wy = (canvas.height / 2 - view.oy) / view.s;
+    setBg(art, data, wx - (art.naturalWidth * s) / 2, wy - (art.naturalHeight * s) / 2, s);
+    say('Background set — Move drags it, Scale resizes.');
+  } catch { say('Background import failed.'); }
+};
+
 gid('btn-import-img').onclick = () => gid('file-image').click();
 (gid('file-image') as HTMLInputElement).onchange = async (e) => {
   const f = (e.target as HTMLInputElement).files?.[0];
@@ -864,21 +986,20 @@ async function traceImageFile(f: File, cw: number, ch: number): Promise<Pt[]> {
     URL.revokeObjectURL(url);
   }
 }
-function refreshList() {
-  const ts = listTracks();
+async function refreshList() {
+  const ts = await listTracks();
   els.sel.innerHTML = ts.map((t) => `<option value="${t.id}">${t.name} (${t.centerline.length}pts)</option>`).join('');
 }
-refreshList();
 // Canvas fills its flex container: backing store tracks CSS size, stored
 // geometry scales proportionally (incl. undo history, so undo stays valid).
 // Space the stored pieces live in. Fresh sessions start at the canvas attrs;
 let spaceW = 0, spaceH = 0;
-function fitCanvas() {
+async function fitCanvas() {
   const r = canvas.getBoundingClientRect();
   const w = Math.max(50, Math.round(r.width)), h = Math.max(50, Math.round(r.height));
   if (!spaceW) {
     // stored pieces remember their own space; legacy drafts assumed 960x600
-    const d = loadPieces();
+    const d = await loadPieces();
     spaceW = d?.w ?? 960; spaceH = d?.h ?? 600;
   }
   if (w !== canvas.width || h !== canvas.height) {
@@ -900,12 +1021,29 @@ function fitCanvas() {
 let fitT = 0;
 new ResizeObserver(() => { window.clearTimeout(fitT); fitT = window.setTimeout(fitCanvas, 120); }).observe(canvas);
 // restore slider state from draft before first rebuild (else width snaps to default)
-{
-  const d = loadDraft();
+async function boot() {
+  await storeReady();
+  const v = await loadView();
+  if (v) view = v;
+  await bootRestore();
+  await refreshList();
+  // restore slider state from draft before first rebuild (else width snaps to default)
+  const d = await loadDraft();
   if (d?.closed) {
     els.width.value = String(d.width); els.widthVal.textContent = String(d.width);
   } else {
     els.width.value = '20'; els.widthVal.textContent = '20'; // no built circuit yet
   }
+  // restore background underlay (async decode, then paint)
+  const b = await loadBg();
+  if (b) {
+    try {
+      const img = await loadImageEl(b.data);
+      bg = { img, data: b.data, x: b.x, y: b.y, s: b.s };
+      (gid('in-bg-scale') as HTMLInputElement).value = String(Math.round(b.s * 100));
+      gid('bg-scale-val').textContent = `${Math.round(b.s * 100)}%`;
+    } catch { /* corrupt data: drop it */ saveBg(null); }
+  }
+  await fitCanvas();
 }
-fitCanvas();
+void boot();

@@ -3,16 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Racing Sim — Track Maker</title>
+  <title>Formula Fruit Fly</title>
   <link rel="stylesheet" href="/src/style.css" />
 </head>
 <body>
   <div id="app">
     <header>
-      <h1>Racing Sim <span id="story-tag">· Story 1: Track Maker</span></h1>
+      <h1>Formula <span class="brand-accent">Fruit Fly</span></h1>
       <div id="status" role="status"></div>
+      <nav id="main-nav">
+        <button id="nav-tracks" class="active">My Tracks</button>
+        <button id="nav-teams">My Teams</button>
+        <button id="nav-races">Races</button>
+      </nav>
     </header>
-    <main>
+    <main id="view-tracks">
       <canvas id="editor" width="960" height="600"></canvas>
       <aside id="panel">
         <section>
@@ -24,7 +29,7 @@
           </div>
         </section>
         <section>
-          <h2>Tools</h2>
+          <h2>Drawing tools</h2>
           <div class="row">
             <button id="btn-tool-free" class="active">Free</button>
             <button id="btn-tool-line">Line</button>
@@ -67,11 +72,25 @@
           </div>
         </section>
         <section>
+          <h2>Background</h2>
+          <div class="row">
+            <button id="btn-bg-import">Import</button>
+            <button id="btn-bg-move">Move</button>
+            <button id="btn-bg-remove">Remove</button>
+          </div>
+          <label>Scale <input id="in-bg-scale" type="range" min="5" max="800" value="100" /> <span id="bg-scale-val">100%</span></label>
+          <input id="file-bg" type="file" accept="image/*,.svg" hidden />
+        </section>
+        <section>
           <h2>Checklist</h2>
           <ul id="checks"></ul>
         </section>
       </aside>
     </main>
+    <section id="view-placeholder" hidden>
+      <h2 id="placeholder-title">My Teams</h2>
+      <p>Page under construction — check back later.</p>
+    </section>
   </div>
   <script type="module" src="/src/main.ts"></script>
 </body>
