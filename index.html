@@ -87,6 +87,39 @@
         </section>
       </aside>
     </main>
+    <section id="view-teams" hidden>
+      <div class="teams-wrap">
+        <section>
+          <h2>Teams</h2>
+          <ul id="team-list"></ul>
+          <div class="row">
+            <button id="btn-team-new">New team</button>
+          </div>
+          <div class="row">
+            <button id="btn-teams-export">Export JSON</button>
+            <button id="btn-teams-import">Import JSON</button>
+            <input id="file-teams" type="file" accept="application/json" hidden />
+          </div>
+          <p class="hint" id="teams-hint"></p>
+        </section>
+        <section>
+          <h2 id="team-form-title">New team</h2>
+          <label>Name <input id="in-team-name" maxlength="40" placeholder="Team name" /></label>
+          <label>Primary <input id="in-team-primary" type="color" value="#e10600" /></label>
+          <label>Secondary <input id="in-team-secondary" type="color" value="#ffffff" /></label>
+          <label>Top speed <input id="in-spec-topSpeed" type="range" min="1" max="10" value="5" /> <span id="spec-topSpeed-val">5</span></label>
+          <label>Acceleration <input id="in-spec-acceleration" type="range" min="1" max="10" value="5" /> <span id="spec-acceleration-val">5</span></label>
+          <label>Braking <input id="in-spec-brakeEfficiency" type="range" min="1" max="10" value="5" /> <span id="spec-brakeEfficiency-val">5</span></label>
+          <label>Turning <input id="in-spec-turningAbility" type="range" min="1" max="10" value="5" /> <span id="spec-turningAbility-val">5</span></label>
+          <canvas id="team-preview" width="220" height="110"></canvas>
+          <div class="row">
+            <button id="btn-team-save">Save team</button>
+            <button id="btn-team-cancel">Cancel</button>
+            <button id="btn-team-del">Delete</button>
+          </div>
+        </section>
+      </div>
+    </section>
     <section id="view-placeholder" hidden>
       <h2 id="placeholder-title">My Teams</h2>
       <p>Page under construction — check back later.</p>

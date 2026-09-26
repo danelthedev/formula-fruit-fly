@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildMask, extractCore, largestComponent, thin, prune, simplifySkeleton, traceLoop } from '../src/skeleton.ts';
-import { blendSeam, checkpoints, circleCenter, closeLoop, dist, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, ribbonSelfOverlap, sampleArc, sampleLine, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, validateGeometry, vertexWidths, widthAt } from '../src/track.ts';
+import { blendSeam, checkpoints, circleCenter, closeLoop, dist, distToTrack, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, ribbonSelfOverlap, sampleArc, sampleLine, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, validateGeometry, vertexWidths, widthAt } from '../src/track.ts';
+import type { Pt } from '../src/track.ts';
 
 test('resample evens spacing on fixture square', () => {
   const sq = [[0, 0], [100, 0], [100, 100], [0, 100]];
@@ -394,4 +395,13 @@ test('selfStrokeOverlaps flags mid-stroke folds, passes lines, arcs and loop clo
   assert.equal(selfStrokeOverlaps(loop, 60), false);
   assert.equal(selfStrokeOverlaps([[0, 0], [10, 0]], 60), false); // too short
   assert.equal(selfStrokeOverlaps(line, 0), false);
+});
+
+test('distToTrack measures segment-projected gap, open-safe', () => {
+  const line: Pt[] = [[0, 0], [100, 0]];
+  assert.equal(distToTrack(line, false, [50, 0]), 0);
+  assert.equal(distToTrack(line, false, [50, 30]), 30);
+  assert.equal(distToTrack(line, false, [150, 0]), 50); // clamped to endpoint
+  assert.equal(distToTrack(line, false, [25, 40]), 40);
+  assert.equal(distToTrack([[0, 0]], false, [10, 10]), Infinity);
 });

@@ -1,3 +1,4 @@
+import type { Team } from './teams';
 import type { Track } from './track';
 // ponytail: IndexedDB (GBs, same origin, no server) with localStorage fallback
 // when IDB can't open (private mode etc). Story 3 weights will share this DB.
@@ -11,6 +12,7 @@ const DB = 'racing-sim', STORE = 'kv', K = {
   pieces: 'rs.v1.pieces',
   view: 'rs.v1.view',
   bg: 'rs.v1.bg',
+  teams: 'rs.v1.teams',
   migrated: 'rs.v1.migrated',
 };
 
@@ -34,13 +36,13 @@ export async function ready(): Promise<void> {
   try {
     db = await openDb();
     if (await rawGet(K.migrated)) return;
-    for (const k of [K.tracks, K.draft, K.pieces, K.view, K.bg]) {
+    for (const k of [K.tracks, K.draft, K.pieces, K.view, K.bg, K.teams]) {
       let v: string | null = null;
       try { v = localStorage.getItem(k); } catch { /* ignore */ }
       if (v != null) await rawSet(k, v);
     }
     await rawSet(K.migrated, '1');
-    for (const k of [K.tracks, K.draft, K.pieces, K.view, K.bg]) {
+    for (const k of [K.tracks, K.draft, K.pieces, K.view, K.bg, K.teams]) {
       try { localStorage.removeItem(k); } catch { /* ignore */ }
     }
   } catch {
@@ -131,4 +133,12 @@ export const saveBg = (b: BgState | null): void => {
 export const loadBg = async (): Promise<BgState | null> => {
   const d = parse<BgState>(await kvGet(K.bg));
   return d && typeof d.data === 'string' && [d.x, d.y, d.s].every(isFinite) && d.s > 0 ? d : null;
+};
+
+export const loadTeams = async (): Promise<Team[]> => {
+  const d = parse<Team[]>(await kvGet(K.teams));
+  return Array.isArray(d) ? d : [];
+};
+export const saveTeams = async (t: Team[]): Promise<void> => {
+  await kvSet(K.teams, JSON.stringify(t)).catch(() => {});
 };

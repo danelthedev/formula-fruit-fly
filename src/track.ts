@@ -5,7 +5,7 @@ export interface Track {
   id: string; name: string;
   centerline: Pt[]; // resampled, closed (first==last omitted; treated cyclically)
   width: number;
-  startS: number;   // arc index into centerline
+  startS: number | null; // arc index into centerline; null = user hasn't placed it
   closed: boolean;  // loop auto-closed (end snapped to start)
   gates: number[];  // manual checkpoints, arc fractions [0,1) sorted along travel
   gateWidths?: number[]; // parallel to gates; missing entries fall back to width
@@ -328,6 +328,26 @@ export function projectFraction(center: Pt[], closed: boolean, p: Pt): number {
     if (d < best) { best = d; bi = i; bt = t; }
   }
   return (bi + bt) / n;
+}
+
+// Distance from a world point to a polyline (segment projection, open-safe).
+// Decides whether a gate/start survived an erase: resampling shifts a few px,
+// an erased section leaves tens of px of gap.
+export function distToTrack(center: Pt[], closed: boolean, p: Pt): number {
+  const n = center.length;
+  if (n < 2) return Infinity;
+  let best = Infinity;
+  const segs = closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const a = center[i], b = center[(i + 1) % n];
+    const vx = b[0] - a[0], vy = b[1] - a[1];
+    const L2 = vx * vx + vy * vy || 1;
+    const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / L2));
+    const dx = p[0] - (a[0] + vx * t), dy = p[1] - (a[1] + vy * t);
+    const d = dx * dx + dy * dy;
+    if (d < best) best = d;
+  }
+  return Math.sqrt(best);
 }
 
 // Edge polylines (clamped indices: correct for open drafts too).

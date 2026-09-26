@@ -1,7 +1,9 @@
 import { buildMask, extractCore, largestComponent, prune, simplifySkeleton, thin, traceLoop } from './skeleton';
-import { blendSeam, checkpoints, closeLoop, dist, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths } from './track';
+import { blendSeam, checkpoints, closeLoop, dist, distToTrack, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths } from './track';
 import type { Pt, Track } from './track';
-import { deleteTrack, listTracks, loadBg, loadDraft, loadPieces, loadView, ready as storeReady, saveBg, saveDraft, savePieces, saveTrack, saveView } from './storage';
+import { deleteTrack, listTracks, loadBg, loadDraft, loadPieces, loadTeams, loadView, ready as storeReady, saveBg, saveDraft, savePieces, saveTeams, saveTrack, saveView } from './storage';
+import { blankTeam, drawCarPreview, sanitizeTeam, teamErrors } from './teams';
+import type { Team } from './teams';
 
 // Model: disjoint pieces (stroke chains). Active piece feeds the track pipeline.
 // New strokes magnetically snap to endpoints; free ends auto-merge with other
@@ -23,7 +25,7 @@ let view = { s: 1, ox: 0, oy: 0 }; // zoom/pan: screen = world*s + o (restored i
 
 let pieces: Pt[][] = [];
 let active = 0;
-interface Snap { pieces: Pt[][]; gates: number[]; widths: number[]; general: number; start: number }
+interface Snap { pieces: Pt[][]; gates: number[]; widths: number[]; general: number; start: number | null }
 let history: Snap[] = [];
 let hIndex = -1;
 let piecesVersion = 0; // bumped on every stroke-data mutation (never on width/gate/start)
@@ -40,6 +42,7 @@ let lineStart: Pt | null = null;
 let arcPts: Pt[] = [];
 let hover: Pt | null = null;
 let erasing = false;
+let eraseCullMsg: string | null = null;
 
 // Background image: world-space offset/scale, drawn under everything.
 let bg: { img: HTMLImageElement; data: string; x: number; y: number; s: number } | null = null;
@@ -68,7 +71,7 @@ async function bootRestore() {
   else if (draft) { pieces = [draft.centerline.map((p) => [...p] as Pt)]; }
   if (draft?.closed === undefined && draft) (draft as Track).closed = true;
   fixActive();
-  if (draft) { track = { ...draft, gates: draft.gates ?? [], gateWidths: draft.gateWidths ?? (draft.gates ?? []).map(() => draft.width) }; say(`Draft restored (${draft.centerline.length} pts)`); }
+  if (draft) { track = { ...draft, startS: !draft.startS ? null : draft.startS, gates: draft.gates ?? [], gateWidths: draft.gateWidths ?? (draft.gates ?? []).map(() => draft.width) }; say(`Draft restored (${draft.centerline.length} pts)`); }
   history = [capture()]; // after track assignment: snapshot includes draft gates
   hIndex = 0;
 }
@@ -94,7 +97,7 @@ function capture(): Snap {
     gates: track?.gates.slice() ?? [],
     widths: track?.gateWidths?.slice() ?? [],
     general: track?.width ?? 60,
-    start: track?.startS ?? 0,
+    start: track?.startS ?? null,
   };
 }
 function pushHistory() {
@@ -105,7 +108,7 @@ function pushHistory() {
 }
 // gates/widths riding along a pieces restore (undo/redo/reject): rebuildTrack picks
 // these up instead of the live track's, since the live track is about to be replaced.
-let incoming: { gates: number[]; widths: number[]; start: number } | null = null;
+let incoming: { gates: number[]; widths: number[]; start: number | null } | null = null;
 function applySnap(s: Snap) {
   pieces = clonePieces(s.pieces); fixActive(); touchPieces();
   incoming = { gates: s.gates.slice(), widths: s.widths.slice(), start: s.start };
@@ -124,7 +127,7 @@ function buildFromPiece(piece: Pt[]): { center: Pt[]; closed: boolean } | null {
 
 // Rebuild track from active piece. Returns false + reverts when the new
 // geometry crosses itself (stays on last-good state). Ribbon overlaps merge.
-function rebuildTrack(keepStart = true): boolean {
+function rebuildTrack(): boolean {
   lastRejection = null; // fresh verdict each rebuild; set below on reject
   if (!pieces.length) { track = null; builtFor = null; persist(); render(); return true; }
   fixActive();
@@ -142,18 +145,40 @@ function rebuildTrack(keepStart = true): boolean {
   // every pass (gates used to walk ~30px per save/load). Undo restores verbatim.
   const prevCenter = track?.centerline, hadCenter = !!prevCenter && prevCenter.length >= 2;
   const prevClosed = track?.closed ?? false;
-  const startWorld = hadCenter ? pointAt(prevCenter!, prevClosed, (track!.startS % prevCenter!.length) / prevCenter!.length) : null;
+  const hasStart = hadCenter && track!.startS != null;
+  const startWorld = hasStart ? pointAt(prevCenter!, prevClosed, (track!.startS! % prevCenter!.length) / prevCenter!.length) : null;
   const gateWorld = hadCenter ? (track?.gates ?? []).map((fr) => pointAt(prevCenter!, prevClosed, fr)) : [];
-  let gates: number[], widths: number[], startS: number;
+  let gates: number[], widths: number[], startS: number | null;
   if (incoming) {
     ({ gates, widths } = incoming);
     startS = incoming.start;
     incoming = null;
   } else {
-    gates = gateWorld.map((p) => projectFraction(built.center, built.closed, p));
-    widths = (track?.gateWidths ?? []).slice(0, gates.length);
-    while (widths.length < gates.length) widths.push(w);
-    startS = startWorld ? Math.round(projectFraction(built.center, built.closed, startWorld) * built.center.length) % built.center.length : keepStart ? (track?.startS ?? 0) : 0;
+    // gates/start survive only if their world spot still lies on the new centerline:
+    // resampling shifts a few px, an erased section leaves erase-radius gap.
+    const ER = ERASE_R / view.s;
+    const gw = track?.gateWidths ?? [];
+    gates = []; widths = [];
+    let culledG = 0, culledS = false;
+    gateWorld.forEach((p, i) => {
+      if (distToTrack(built.center, built.closed, p) >= ER) { culledG++; return; }
+      gates.push(projectFraction(built.center, built.closed, p));
+      widths.push(gw[i] ?? w);
+    });
+    if (startWorld && distToTrack(built.center, built.closed, startWorld) < ER) {
+      startS = Math.round(projectFraction(built.center, built.closed, startWorld) * built.center.length) % built.center.length;
+    } else {
+      if (startWorld) culledS = true;
+      startS = null; // never auto-placed: user sets it explicitly
+    }
+    if (culledG || culledS) {
+      const parts: string[] = [];
+      if (culledG) parts.push(`${culledG} checkpoint${culledG === 1 ? '' : 's'}`);
+      if (culledS) parts.push('start line');
+      const msg = `${parts.join(' + ')} removed — erased section.`;
+      if (erasing) eraseCullMsg = msg; // pointerup folds it into 'Erased.'
+      else say(msg);
+    }
   }
   if (built.closed && validateGeometry(built.center, w) === 'crossed') {
     applySnap(history[hIndex]);
@@ -170,12 +195,12 @@ function rebuildTrack(keepStart = true): boolean {
   track = {
     id: prev?.id ?? uid(), name: prev?.name ?? '',
     centerline: built.center, width: w,
-    startS: Math.min(startS, built.center.length - 1),
+    startS: startS == null ? null : Math.min(startS, built.center.length - 1),
     closed: built.closed,
     gates, // world-anchored fractions
     gateWidths: widths,
   };
-  if (track.startS >= built.center.length) track.startS = 0;
+  if (track.startS != null) track.startS = Math.min(track.startS, built.center.length - 1);
   pinOpenWidth();
   builtFor = { v: piecesVersion, active };
   refreshWidthCaps();
@@ -381,7 +406,7 @@ canvas.addEventListener('pointermove', (e) => {
 canvas.addEventListener('pointerup', (e) => {
   if (panning) { panning = false; panLast = null; return; }
   if (bgDrag) { bgDrag = null; saveBgState(); return; }
-  if (erasing) { erasing = false; if (eraseChanged) { pushHistory(); say('Erased.'); } return; }
+  if (erasing) { erasing = false; if (eraseChanged) { pushHistory(); say(eraseCullMsg ? `Erased. ${eraseCullMsg}` : 'Erased.'); eraseCullMsg = null; } return; }
   if (tool === 'line' && lineStart) {
     const seg = drawing ?? [];
     lineStart = null; drawing = null;
@@ -593,10 +618,12 @@ function render() {
         ctx.lineWidth = i === selectedGate ? 4 : 2;
         ctx.beginPath(); ctx.moveTo(c.a[0], c.a[1]); ctx.lineTo(c.b[0], c.b[1]); ctx.stroke();
       });
-      // start line: own gate at startS, independent of checkpoints
-      const s0 = gateAt(track, track.startS % n / n);
-      ctx.strokeStyle = '#fff'; ctx.lineWidth = 5;
-      ctx.beginPath(); ctx.moveTo(s0.a[0], s0.a[1]); ctx.lineTo(s0.b[0], s0.b[1]); ctx.stroke();
+      // start line: own gate at startS, independent of checkpoints (only when placed)
+      if (track.startS != null) {
+        const s0 = gateAt(track, track.startS % n / n);
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 5;
+        ctx.beginPath(); ctx.moveTo(s0.a[0], s0.a[1]); ctx.lineTo(s0.b[0], s0.b[1]); ctx.stroke();
+      }
     }
   }
   // arc tool: clicked points + live preview
@@ -639,7 +666,7 @@ function validate() {
   const n = track?.centerline.length ?? 0;
   items.push([(track?.closed ?? false) && n >= 32, 'Closed loop']);
   if (lastRejection) items.push([false, lastRejection]);
-  items.push([(track?.startS ?? -1) >= 0 && n >= 8, 'Start line placed']);
+  items.push([track?.startS != null && n >= 8, 'Start line placed']);
   const ng = track?.gates.length ?? 0;
   items.push([ng >= 3, `${ng}/3 checkpoints`]);
   checks.innerHTML = items.map(([ok, t]) => `<li class="${ok ? 'ok' : 'bad'}">${ok ? '✓' : '✗'} ${t}</li>`).join('');
@@ -769,17 +796,132 @@ gid('btn-tool-gate').onclick = () => setTool('gate');
 // ---- top-level views: builder vs placeholders ----
 type MainView = 'tracks' | 'teams' | 'races';
 function showView(v: MainView) {
-  const isTracks = v === 'tracks';
-  (gid('view-tracks') as HTMLElement).hidden = !isTracks;
-  (gid('view-placeholder') as HTMLElement).hidden = isTracks;
-  if (!isTracks) gid('placeholder-title').textContent = v === 'teams' ? 'My Teams' : 'Races';
+  (gid('view-tracks') as HTMLElement).hidden = v !== 'tracks';
+  (gid('view-teams') as HTMLElement).hidden = v !== 'teams';
+  const ph = v !== 'tracks' && v !== 'teams';
+  (gid('view-placeholder') as HTMLElement).hidden = !ph;
+  if (v === 'teams') renderTeams();
+  if (ph) gid('placeholder-title').textContent = 'Races'; // only races still parked here
   (Object.entries({ 'nav-tracks': 'tracks', 'nav-teams': 'teams', 'nav-races': 'races' }) as [string, MainView][])
     .forEach(([id, vv]) => gid(id).classList.toggle('active', vv === v));
-  say(isTracks ? '' : 'Page under construction — check back later.');
+  say(v === 'tracks' ? '' : v === 'teams' ? `${teams.length} team${teams.length === 1 ? '' : 's'} — training needs at least 1.` : 'Page under construction — check back later.');
 }
 gid('nav-tracks').onclick = () => showView('tracks');
 gid('nav-teams').onclick = () => showView('teams');
 gid('nav-races').onclick = () => showView('races');
+
+// ---- teams (Story 2: Team Configurer) ----
+let teams: Team[] = [];
+let editingId: string | null = null;
+const SPECS = ['topSpeed', 'acceleration', 'brakeEfficiency', 'turningAbility'] as const;
+function formTeam(): Team {
+  const num = (id: string) => Number((gid(id) as HTMLInputElement).value);
+  return {
+    id: editingId ?? '',
+    name: (gid('in-team-name') as HTMLInputElement).value,
+    primary: (gid('in-team-primary') as HTMLInputElement).value,
+    secondary: (gid('in-team-secondary') as HTMLInputElement).value,
+    topSpeed: num('in-spec-topSpeed'),
+    acceleration: num('in-spec-acceleration'),
+    brakeEfficiency: num('in-spec-brakeEfficiency'),
+    turningAbility: num('in-spec-turningAbility'),
+  };
+}
+function paintPreview() {
+  const cv = gid('team-preview') as HTMLCanvasElement;
+  const t = formTeam();
+  for (const k of SPECS) gid(`spec-${k}-val`).textContent = String(t[k]);
+  drawCarPreview(cv.getContext('2d')!, cv.width, cv.height, t.primary, t.secondary);
+}
+function renderTeams() {
+  const ul = gid('team-list');
+  ul.innerHTML = '';
+  teams.forEach((t) => {
+    const li = document.createElement('li');
+    if (t.id === editingId) li.classList.add('sel');
+    const sw = document.createElement('span');
+    sw.className = 'swatch'; sw.style.background = t.primary;
+    const nm = document.createElement('span');
+    nm.className = 'tname'; nm.textContent = t.name;
+    const sp = document.createElement('span');
+    sp.className = 'tspecs';
+    sp.textContent = `${t.topSpeed}/${t.acceleration}/${t.brakeEfficiency}/${t.turningAbility}`;
+    const b = document.createElement('button');
+    b.textContent = 'Edit';
+    b.onclick = () => { editingId = t.id; renderTeams(); };
+    li.append(sw, nm, sp, b);
+    ul.appendChild(li);
+  });
+  const ed = editingId ? teams.find((t) => t.id === editingId) : null;
+  const f = ed ?? blankTeam('');
+  (gid('in-team-name') as HTMLInputElement).value = f.name;
+  (gid('in-team-primary') as HTMLInputElement).value = f.primary;
+  (gid('in-team-secondary') as HTMLInputElement).value = f.secondary;
+  for (const k of SPECS) (gid(`in-spec-${k}`) as HTMLInputElement).value = String(f[k]);
+  gid('team-form-title').textContent = ed ? `Edit team` : 'New team';
+  (gid('btn-team-del') as HTMLButtonElement).disabled = !ed;
+  gid('teams-hint').textContent = teams.length ? '' : 'Create at least 1 team to unlock training.';
+  paintPreview();
+}
+gid('btn-team-new').onclick = () => { editingId = null; renderTeams(); };
+gid('btn-team-cancel').onclick = () => { editingId = null; renderTeams(); };
+gid('btn-team-save').onclick = async () => {
+  const f = formTeam();
+  const errs = teamErrors(f.name, editingId ?? '', teams);
+  if (errs.length) { say(errs[0]); return; }
+  f.name = f.name.trim();
+  if (editingId && teams.some((t) => t.id === editingId)) {
+    teams = teams.map((t) => (t.id === editingId ? f : t));
+  } else {
+    f.id = uid(); teams.push(f); editingId = f.id;
+  }
+  await saveTeams(teams);
+  renderTeams();
+  say(`Team "${f.name}" saved.`);
+};
+gid('btn-team-del').onclick = async () => {
+  if (!editingId) return;
+  teams = teams.filter((t) => t.id !== editingId);
+  editingId = null;
+  await saveTeams(teams);
+  renderTeams();
+  say('Team deleted.');
+};
+for (const k of SPECS) (gid(`in-spec-${k}`) as HTMLInputElement).oninput = () => paintPreview();
+gid('in-team-primary').oninput = () => paintPreview();
+gid('in-team-secondary').oninput = () => paintPreview();
+gid('btn-teams-export').onclick = () => {
+  if (!teams.length) { say('Nothing to export'); return; }
+  const blob = new Blob([JSON.stringify(teams, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'teams.json'; a.click();
+  URL.revokeObjectURL(a.href);
+};
+gid('btn-teams-import').onclick = () => gid('file-teams').click();
+(gid('file-teams') as HTMLInputElement).onchange = async (e) => {
+  const f = (e.target as HTMLInputElement).files?.[0];
+  (e.target as HTMLInputElement).value = '';
+  if (!f) return;
+  try {
+    const arr = JSON.parse(await f.text());
+    if (!Array.isArray(arr)) throw new Error('bad file');
+    const seen = new Set<string>();
+    const clean: Team[] = [];
+    for (const o of arr) {
+      const t = sanitizeTeam(o);
+      if (!t) continue;
+      let n = t.name, k = 2;
+      while (seen.has(n.toLowerCase())) n = `${t.name} ${k++}`;
+      seen.add(n.toLowerCase());
+      clean.push({ ...t, id: uid(), name: n });
+    }
+    if (!clean.length) { say('Import failed: no valid teams.'); return; }
+    teams = clean; editingId = clean[0].id;
+    await saveTeams(teams);
+    renderTeams();
+    say(`Imported ${clean.length} team${clean.length === 1 ? '' : 's'}.`);
+  } catch { say('Import failed: invalid teams JSON'); }
+};
 (gid('in-gate-width') as HTMLInputElement).oninput = (e) => {
   const input = e.target as HTMLInputElement;
   let v = Number(input.value);
@@ -812,7 +954,7 @@ els.load.onclick = async () => {
   if (!t || t.centerline.length < 2) return;
   track = { ...t, gates: t.gates ?? [], gateWidths: t.gateWidths ?? (t.gates ?? []).map(() => t.width) };
   track.closed = t.closed ?? dist(track.centerline[0], track.centerline[track.centerline.length - 1]) < 60;
-  track.startS = Math.min(track.startS ?? 0, track.centerline.length - 1);
+  track.startS = !track.startS ? null : Math.min(track.startS, track.centerline.length - 1); // legacy auto-start (0) counts as unset
   pieces = [t.centerline.map((p) => [...p] as Pt)]; active = 0; selectedGate = null;
   touchPieces();
   builtFor = { v: piecesVersion, active }; // verbatim: saved centerline needs no reprocessing
@@ -840,7 +982,7 @@ els.file.onchange = async () => {
     if (!t.centerline?.length) throw new Error('bad file');
     track = { ...t, id: uid(), gates: t.gates ?? [], gateWidths: t.gateWidths ?? (t.gates ?? []).map(() => t.width) };
     track.closed = t.closed ?? dist(track.centerline[0], track.centerline[track.centerline.length - 1]) < 60;
-    track.startS = Math.min(track.startS ?? 0, track.centerline.length - 1);
+    track.startS = !track.startS ? null : Math.min(track.startS, track.centerline.length - 1); // legacy auto-start (0) counts as unset
     pieces = [track.centerline.map((p) => [...p] as Pt)]; active = 0; selectedGate = null;
     touchPieces();
     builtFor = { v: piecesVersion, active }; // verbatim: no reprocessing
@@ -1016,7 +1158,7 @@ async function fitCanvas() {
     }
     canvas.width = w; canvas.height = h;
   }
-  rebuildTrack(false);
+  rebuildTrack();
 }
 let fitT = 0;
 new ResizeObserver(() => { window.clearTimeout(fitT); fitT = window.setTimeout(fitCanvas, 120); }).observe(canvas);
@@ -1027,6 +1169,7 @@ async function boot() {
   if (v) view = v;
   await bootRestore();
   await refreshList();
+  teams = await loadTeams(); renderTeams();
   // restore slider state from draft before first rebuild (else width snaps to default)
   const d = await loadDraft();
   if (d?.closed) {
