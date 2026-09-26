@@ -44,6 +44,23 @@ test('straight into the wall crashes; crawl times out', async () => {
   assert.equal(slow.done, 'timeout');
 });
 
+test('parked genome stalls out fast instead of burning the timeout', async () => {
+  const idx = makeTrackIndex(oval());
+  const r = await runEpisode(idx, phys, () => [0, 0, 0], { laps: 1, maxTime: 60 });
+  assert.equal(r.done, 'crash');
+  assert.ok(r.time < 20, `stalled at ${r.time}s instead of 60s timeout`);
+  assert.ok(r.steps < 60 * 20);
+});
+
+test('gate order precomputed sorted; matches gate count', () => {
+  const t = oval();
+  t.gates = [0.75, 0.1, 0.5];
+  const idx = makeTrackIndex(t);
+  assert.equal(idx.gateOrder.length, idx.gates.length);
+  const frs = idx.gateOrder.map((o) => o.fr);
+  assert.deepEqual([...frs].sort((a, b) => a - b), frs);
+});
+
 test('observe returns 16 normalized dims', () => {
   const idx = makeTrackIndex(oval());
   const car: CarState = { x: 200, y: 0, heading: Math.PI / 2, vx: 0, vy: 0 };

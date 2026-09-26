@@ -1,6 +1,6 @@
 import { mulberry32, runEpisode } from './sim.ts';
 import type { Control, EpisodeResult, TrackIndex } from './sim.ts';
-import { actObs, mutateGenome, randomGenome, setGenome } from './nn.ts';
+import { forwardGenome, mutateGenome, randomGenome } from './nn.ts';
 import type { GenomeNet } from './nn.ts';
 import type { PhysicsParams } from './teams.ts';
 
@@ -38,7 +38,6 @@ const tick = () => new Promise<void>((res) => setTimeout(res, 0));
 export async function runEpoch(
   idx: TrackIndex,
   phys: PhysicsParams,
-  net: GenomeNet,
   pop: Float32Array[],
   cfg: GAConfig,
   seed: number,
@@ -48,10 +47,10 @@ export async function runEpoch(
   const scored: { g: Float32Array; f: number }[] = [];
   for (let i = 0; i < pop.length; i++) {
     if (stopped()) break;
-    setGenome(net, pop[i]);
+    const g = pop[i];
     let f = 0;
     for (let e = 0; e < cfg.episodes; e++) {
-      const policy = (obs: number[]): Control => actObs(net, obs);
+      const policy = (obs: number[]): Control => forwardGenome(g, obs);
       f += fitnessOf(await runEpisode(idx, phys, policy, { laps: cfg.laps, maxTime: cfg.timeout }));
     }
     scored.push({ g: pop[i], f: f / cfg.episodes });

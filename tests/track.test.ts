@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildMask, extractCore, largestComponent, thin, prune, simplifySkeleton, traceLoop } from '../src/skeleton.ts';
-import { blendSeam, checkpoints, circleCenter, closeLoop, dist, distToTrack, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, ribbonSelfOverlap, sampleArc, sampleLine, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, validateGeometry, vertexWidths, widthAt } from '../src/track.ts';
+import { blendSeam, checkpoints, circleCenter, closeLoop, dist, distToTrack, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, ribbonSelfOverlap, sampleArc, sampleLine, sanitizePoints, sanitizeTrack, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, validateGeometry, vertexWidths, widthAt } from '../src/track.ts';
 import type { Pt } from '../src/track.ts';
 
 test('resample evens spacing on fixture square', () => {
@@ -404,4 +404,23 @@ test('distToTrack measures segment-projected gap, open-safe', () => {
   assert.equal(distToTrack(line, false, [150, 0]), 50); // clamped to endpoint
   assert.equal(distToTrack(line, false, [25, 40]), 40);
   assert.equal(distToTrack([[0, 0]], false, [10, 10]), Infinity);
+});
+
+test('sanitize drops non-finite points; sanitizeTrack repairs or rejects', () => {
+  const pts: Pt[] = [[0, 0], [NaN, 1], [2, Infinity], [3, 4], [5, 5]];
+  assert.deepEqual(sanitizePoints(pts), [[0, 0], [3, 4], [5, 5]]);
+  assert.deepEqual(sanitizePoints(null as unknown as Pt[]), []);
+  const t = {
+    id: 'x', name: 'x', centerline: [[0, 0], [NaN, 0], [10, 0], [20, 0]] as Pt[],
+    width: NaN, startS: 0, closed: true, gates: [0.5, NaN], gateWidths: [10],
+  };
+  const clean = sanitizeTrack(t);
+  assert.ok(clean);
+  assert.equal(clean!.centerline.length, 3);
+  assert.equal(clean!.width, 60);
+  assert.equal(clean!.startS, null); // legacy 0 counts as unset
+  assert.deepEqual(clean!.gates, [0.5]);
+  assert.equal(sanitizeTrack({ ...t, centerline: [[NaN, NaN]] as Pt[] }), null);
+  assert.equal(sanitizeTrack(null as unknown as typeof t), null);
+  assert.equal(sanitizeTrack({ ...t, gates: undefined as unknown as number[] })!.gates.length, 0);
 });

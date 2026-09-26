@@ -14,6 +14,26 @@ export interface Track {
 
 export const dist = (a: Pt, b: Pt) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 
+// Trust-boundary sanitation: non-finite coords (NaN/Infinity from corrupt files
+// or storage) render as nothing and poison fits/views, so drop them on the way
+// in. Never throws; returns a clean track or null when nothing salvageable.
+export function sanitizePoints(ps: Pt[]): Pt[] {
+  // typeof checks first: JSON null coords coerce to 0 in canvas calls, silently
+  // warping geometry — a corrupt point must go, not become (0,0).
+  return (Array.isArray(ps) ? ps : []).filter((p) => Array.isArray(p) && typeof p[0] === 'number' && typeof p[1] === 'number' && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+}
+export function sanitizeTrack(t: Track): Track | null {
+  if (!t || !Array.isArray((t as Track).centerline)) return null;
+  const centerline = sanitizePoints(t.centerline);
+  if (centerline.length < 2) return null;
+  const gates = Array.isArray(t.gates) ? t.gates.filter((g) => Number.isFinite(g)) : [];
+  const gateWidths = Array.isArray(t.gateWidths) ? t.gateWidths.map((w) => (Number.isFinite(w) && w > 0 ? w : t.width)) : gates.map(() => t.width);
+  const width = Number.isFinite(t.width) && t.width > 0 ? t.width : 60;
+  const n = centerline.length;
+  const startS = Number.isInteger(t.startS) && (t.startS as number) > 0 && (t.startS as number) < n ? t.startS : null; // 0 counts as unset (legacy auto-start)
+  return { ...t, centerline, width, startS, closed: !!t.closed, gates, gateWidths };
+}
+
 // Even-spacing resample (cyclic if closed)
 export function resample(pts: Pt[], step = 8, closed = true): Pt[] {
   // drop consecutive duplicates: zero-length segments blow up interpolation (t → 1e6),

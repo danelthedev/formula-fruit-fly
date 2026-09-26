@@ -1,9 +1,9 @@
 import { buildMask, extractCore, largestComponent, prune, simplifySkeleton, thin, traceLoop } from './skeleton.ts';
-import { blendSeam, checkpoints, closeLoop, dist, distToTrack, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths, widthAt } from './track.ts';
+import { blendSeam, checkpoints, closeLoop, dist, distToTrack, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, sanitizePoints, sanitizeTrack, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths, widthAt } from './track.ts';
 import type { Pt, Track } from './track.ts';
 import { deleteTrack, listTracks, loadBg, loadDraft, loadPieces, loadPopulation, loadRaceCfg, loadRaceSession, loadTeams, loadView, loadWeights, ready as storeReady, saveBg, saveDraft, savePieces, savePopulation, saveRaceCfg, saveRaceSession, saveTeams, saveTrack, saveView, saveWeights } from './storage.ts';
 import { initPop, runEpoch } from './ga.ts';
-import { actObs, buildNet, decodeWeightsFile, encodeWeightsFile, getGenome, mutateGenome, randomGenome, setGenome } from './nn.ts';
+import { buildNet, decodeWeightsFile, encodeWeightsFile, forwardGenome, mutateGenome } from './nn.ts';
 import type { EpochResult, GAConfig } from './ga.ts';
 import type { GenomeNet } from './nn.ts';
 import { locate, makeTrackIndex, mulberry32, observe, spawn, stepCar, DT } from './sim.ts';
@@ -74,12 +74,13 @@ const allRaw = (): Pt[] => pieces.flat();
 // ---- init (async: storage lives in IndexedDB) ----
 async function bootRestore() {
   const saved = await loadPieces();
-  const draft = await loadDraft();
-  if (saved) { pieces = saved.pieces; active = saved.active; }
+  const rawDraft = await loadDraft();
+  const draft = rawDraft ? sanitizeTrack(rawDraft) : null;
+  if (rawDraft && !draft) say('Saved draft was corrupt — starting fresh.');
+  if (saved) { pieces = saved.pieces.map(sanitizePoints).filter((p) => p.length > 0); active = saved.active; }
   else if (draft) { pieces = [draft.centerline.map((p) => [...p] as Pt)]; }
-  if (draft?.closed === undefined && draft) (draft as Track).closed = true;
   fixActive();
-  if (draft) { track = { ...draft, startS: !draft.startS ? null : draft.startS, gates: draft.gates ?? [], gateWidths: draft.gateWidths ?? (draft.gates ?? []).map(() => draft.width) }; say(`Draft restored (${draft.centerline.length} pts)`); }
+  if (draft) { track = { ...draft }; say(`Draft restored (${draft.centerline.length} pts)`); }
   history = [capture()]; // after track assignment: snapshot includes draft gates
   hIndex = 0;
 }
@@ -317,9 +318,12 @@ const els = {
   exp: gid('btn-export'), imp: gid('btn-import'),
   file: gid('file-import') as HTMLInputElement,
 };
-const pos = (e: PointerEvent): Pt => {
-  // scale client px -> canvas backing px -> world (inverse view)
+const pos = (e: PointerEvent): Pt | null => {
+  // scale client px -> canvas backing px -> world (inverse view). Null when
+  // unmappable (hidden canvas, broken view): callers ignore it, so poison
+  // (Infinity/NaN) can never be committed into geometry or persisted.
   const r = canvas.getBoundingClientRect();
+  if (!(r.width > 0) || !Number.isFinite(view.s) || view.s <= 0 || !Number.isFinite(view.ox + view.oy)) return null;
   const kx = canvas.width / r.width;
   return [((e.clientX - r.left) * kx - view.ox) / view.s, ((e.clientY - r.top) * kx - view.oy) / view.s];
 };
@@ -339,6 +343,7 @@ canvas.addEventListener('pointerdown', (e) => {
   if (e.button === 2 && tool !== 'gate') return; // right-click is gate-select only
   canvas.setPointerCapture(e.pointerId);
   const p = pos(e);
+  if (!p) return; // unmappable event (hidden canvas): ignore, never commit poison
   if (setStartMode) { // start-pick mode: only job is placing the start line
     if (track && track.closed && track.centerline.length > 8) {
       track.startS = nearestIndex(track.centerline, p);
@@ -399,6 +404,7 @@ canvas.addEventListener('pointermove', (e) => {
     return;
   }
   hover = pos(e);
+  if (!hover) return;
   if (tool === 'arc' && arcPts.length > 0) { render(); return; }
   if (tool === 'gate') { render(); return; } // ghost gate follows cursor
   if (tool === 'erase') { render(); if (erasing && eraseAt(hover)) eraseChanged = true; return; }
@@ -469,6 +475,24 @@ canvas.addEventListener('wheel', (e) => {
 }, { passive: false });
 // middle-click would autoscroll: suppress it
 canvas.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
+
+// Frame all content (pieces + built track): the way back when zoom/pan loses
+// the track. Also applied after imports and loads so they always land visible.
+function fitViewToContent() {
+  const pts: Pt[] = pieces.flat();
+  if (track) pts.push(...track.centerline);
+  if (!pts.length) { view = { s: 1, ox: 0, oy: 0 }; }
+  else {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const [x, y] of pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+    const m = 60, W = canvas.width, H = canvas.height;
+    const s = Math.min((W - 2 * m) / Math.max(1, x1 - x0), (H - 2 * m) / Math.max(1, y1 - y0));
+    view = { s, ox: W / 2 - ((x0 + x1) / 2) * s, oy: H / 2 - ((y0 + y1) / 2) * s };
+  }
+  saveView(view); render();
+}
+gid('btn-fit').onclick = () => fitViewToContent();
+canvas.addEventListener('dblclick', () => fitViewToContent());
 
 // ---- render ----
 // Smooth-stroke paths: midpoint quadratics render curves without facets,
@@ -671,6 +695,7 @@ function render() {
   validate();
 }
 
+let lastValidateHtml = '';
 function validate() {
   const items: [boolean, string][] = [];
   const n = track?.centerline.length ?? 0;
@@ -679,7 +704,8 @@ function validate() {
   items.push([track?.startS != null && n >= 8, 'Start line placed']);
   const ng = track?.gates.length ?? 0;
   items.push([ng >= 3, `${ng}/3 checkpoints`]);
-  checks.innerHTML = items.map(([ok, t]) => `<li class="${ok ? 'ok' : 'bad'}">${ok ? '✓' : '✗'} ${t}</li>`).join('');
+  const html = items.map(([ok, t]) => `<li class="${ok ? 'ok' : 'bad'}">${ok ? '✓' : '✗'} ${t}</li>`).join('');
+  if (html !== lastValidateHtml) { checks.innerHTML = html; lastValidateHtml = html; } // same content, no DOM churn per mousemove
 }
 
 // ---- controls ----
@@ -885,6 +911,7 @@ interface TeamTrain {
   card?: { status: HTMLElement; stat: HTMLElement; canvas: HTMLCanvasElement; toggle: HTMLButtonElement; exp: HTMLButtonElement };
 }
 let practiceTeams: TeamTrain[] = [];
+let seedDonors: { id: string; name: string; weights: Float32Array }[] = []; // teams with saved weights: transfer-learning donors
 let practiceNet: GenomeNet | null = null;
 let practiceIdx: TrackIndex | null = null;
 let weightsImportTarget: string | null = null;
@@ -979,12 +1006,14 @@ async function enterPractice(): Promise<boolean> {
     }
     practiceTeams.push({ teamId: id, status: best ? 'stopped' : 'idle', pop, epoch: 0, best, bestFit: -Infinity, lastAvg: NaN, histBest: [], histAvg: [], seed: (Math.random() * 2 ** 31) | 0 });
   }
+  seedDonors = [];
+  for (const t of teams) {
+    const w = await loadWeights(t.id);
+    if (w && w.weights.length === net.size) seedDonors.push({ id: t.id, name: t.name, weights: new Float32Array(w.weights) });
+  }
   (gid('in-ga-preview') as HTMLInputElement).value = String(raceCfg.previewEvery ?? 0);
   buildPracticeCards();
   updateQualiGate();
-  // one-time GPU warmup (shader compile) so the first Start click doesn't hitch
-  setGenome(net, randomGenome(net, Math.random));
-  for (let i = 0; i < 5; i++) actObs(net, new Array(16).fill(0));
   return true;
 }
 
@@ -1021,10 +1050,47 @@ function buildPracticeCards() {
     exp.onclick = () => exportTeamWeights(st.teamId);
     row.append(toggle, imp, exp);
     card.append(head, stat, cv, row);
+    const donors = seedDonors.filter((d) => d.id !== st.teamId);
+    if (!st.best && donors.length) {
+      const srow = document.createElement('div');
+      srow.className = 'row';
+      const lab = document.createElement('span');
+      lab.className = 'stat';
+      lab.textContent = 'No weights — seed from';
+      const sel = document.createElement('select');
+      for (const d of donors) { const o = document.createElement('option'); o.value = d.id; o.textContent = d.name; sel.appendChild(o); }
+      const apply = document.createElement('button');
+      apply.textContent = 'Seed';
+      apply.title = 'Start as mutations of their trained weights. Driving skill transfers; training adapts it to this track.';
+      apply.onclick = () => { void seedFromDonor(st.teamId, sel.value); };
+      srow.append(lab, sel, apply);
+      card.append(srow);
+    }
     box.appendChild(card);
     st.card = { status, stat, canvas: cv, toggle, exp };
   }
   updatePracticeCards();
+}
+
+// Transfer learning: start a weightless team as mutations of another team's
+// trained weights. Driving skill transfers across tracks; further training
+// adapts it to this one.
+async function seedFromDonor(teamId: string, donorId: string) {
+  const st = practiceTeams.find((s) => s.teamId === teamId);
+  const donor = seedDonors.find((d) => d.id === donorId);
+  const team = teams.find((t) => t.id === teamId);
+  if (!st || !donor || !team || st.best) return;
+  const cfg = practiceCfg();
+  const b = donor.weights.slice();
+  st.best = b.slice();
+  st.bestFit = -Infinity;
+  st.pop = [b, ...Array.from({ length: Math.max(1, cfg.popSize - 1) }, () => mutateGenome(b, cfg.sigma, Math.random))];
+  st.status = 'stopped';
+  await saveWeights(teamId, encodeWeightsFile(teamId, team.name, st.best));
+  await savePopulation(teamId, st.pop.map((g) => [...g]));
+  say(`${team.name} seeded from ${donor.name} — skill transfers, training adapts it to this track.`);
+  buildPracticeCards();
+  updateQualiGate();
 }
 
 function updatePracticeCards() {
@@ -1084,7 +1150,7 @@ async function trainOneEpoch(st: TeamTrain) {
   epochActive = true;
   let r: EpochResult;
   try {
-    r = await runEpoch(practiceIdx, phys, practiceNet, st.pop, cfg, (st.seed = (st.seed + 1) >>> 0), () => st.status !== 'training' || previewHold);
+    r = await runEpoch(practiceIdx, phys, st.pop, cfg, (st.seed = (st.seed + 1) >>> 0), () => st.status !== 'training' || previewHold);
   } finally { epochActive = false; }
   st.pop = r.pop;
   if (r.partial) { updatePracticeCards(); return; }
@@ -1095,6 +1161,10 @@ async function trainOneEpoch(st: TeamTrain) {
   if (!st.best || r.bestFitness > st.bestFit) { st.best = r.best; st.bestFit = r.bestFitness; }
   await saveWeights(st.teamId, encodeWeightsFile(st.teamId, team.name, st.best));
   await savePopulation(st.teamId, st.pop.map((g) => [...g]));
+  if (st.best && !seedDonors.some((d) => d.id === st.teamId)) {
+    seedDonors.push({ id: st.teamId, name: team.name, weights: st.best.slice() }); // new donor: weightless teams can seed from it
+    buildPracticeCards();
+  }
   const X = raceCfg?.previewEvery ?? 0;
   if (X > 0 && st.epoch > 0 && st.epoch % X === 0 && (previewedEpochs.get(st.teamId) ?? -1) !== st.epoch) {
     previewedEpochs.set(st.teamId, st.epoch);
@@ -1163,7 +1233,6 @@ function animateGhostLap(): Promise<void> {
       for (const g of previewCars) {
         if (g.done) continue;
         allDone = false;
-        setGenome(practiceNet, g.genome);
         const loc = locate(previewIdx, g.car.x, g.car.y, g.hint);
         g.hint = loc.bi;
         if (g.prevFrac == null) g.prevFrac = loc.frac;
@@ -1173,7 +1242,7 @@ function animateGhostLap(): Promise<void> {
         g.prog += d;
         g.prevFrac = loc.frac;
         if (loc.dist > loc.hw || g.prog >= 1 || ++g.frames > 60 * 75) { g.done = true; continue; }
-        stepCar(g.car, actObs(practiceNet, observe(previewIdx, g.car, loc)), g.phys);
+        stepCar(g.car, forwardGenome(g.genome, observe(previewIdx, g.car, loc)), g.phys);
       }
       render();
       if (allDone) { setTimeout(resolve, 800); return; }
@@ -1346,17 +1415,16 @@ async function qualiLoop() {
   }
   if (quali && !quali.aborted && quali.idx >= quali.roster.length) {
     (gid('btn-start-race') as HTMLButtonElement).disabled = false;
-    say('Qualifying complete — start the race.');
   }
   if (quali) quali.running = false;
 }
 
 function animateQualiLap(d: Driver, timeout: number): Promise<{ time: number; progress: number; done: string }> {
   return new Promise((resolve) => {
-    const idx = qualiIdx!, net = practiceNet!;
+    const idx = qualiIdx!;
     const team = teams.find((t) => t.id === d.teamId)!;
     const phys = physicsFor(team);
-    setGenome(net, new Float32Array(d.genome));
+    const genome = new Float32Array(d.genome);
     const { car } = spawn(idx);
     let hint = -1, prevFrac: number | null = null, prog = 0, time = 0, frames = 0;
     const color = team.primary;
@@ -1374,7 +1442,7 @@ function animateQualiLap(d: Driver, timeout: number): Promise<{ time: number; pr
       if (loc.dist > loc.hw) return resolve({ time, progress: prog, done: 'crash' });
       if (prog >= 1) return resolve({ time, progress: prog, done: 'lap' });
       if (time >= timeout || ++frames > 60 * 120) return resolve({ time, progress: prog, done: 'timeout' });
-      stepCar(car, actObs(net, observe(idx, car, loc)), phys);
+      stepCar(car, forwardGenome(genome, observe(idx, car, loc)), phys);
       time += DT;
       drawQualiScene([{ x: car.x, y: car.y, heading: car.heading, color, secondary: team.secondary }]);
       renderQualiBoardLive(time, prog);
@@ -1532,7 +1600,6 @@ function raceStep() {
     if (r.done) continue;
     allDone = false;
     try {
-    setGenome(practiceNet, r.genome);
     const loc = locate(raceIdx, r.car.x, r.car.y, r.hint);
     r.hint = loc.bi;
     if (r.prevFrac == null) r.prevFrac = loc.frac;
@@ -1544,7 +1611,7 @@ function raceStep() {
     if (loc.dist > loc.hw) { r.done = true; r.dnf = true; continue; }
     if (r.prog >= raceLaps) { r.done = true; r.finishTime = r.time; continue; }
     if (r.time > 60 * 180) { r.done = true; r.dnf = true; continue; }
-    stepCar(r.car, actObs(practiceNet, observe(raceIdx, r.car, loc)), r.phys);
+    stepCar(r.car, forwardGenome(r.genome, observe(raceIdx, r.car, loc)), r.phys);
     r.time += DT;
     } catch { r.done = true; r.dnf = true; }
   }
@@ -1776,11 +1843,11 @@ els.save.onclick = async () => {
   } catch { say('Save failed: browser storage is full — remove the background or delete old tracks.'); }
 };
 els.load.onclick = async () => {
-  const t = (await listTracks()).find((t) => t.id === els.sel.value);
-  if (!t || t.centerline.length < 2) return;
-  track = { ...t, gates: t.gates ?? [], gateWidths: t.gateWidths ?? (t.gates ?? []).map(() => t.width) };
-  track.closed = t.closed ?? dist(track.centerline[0], track.centerline[track.centerline.length - 1]) < 60;
-  track.startS = !track.startS ? null : Math.min(track.startS, track.centerline.length - 1); // legacy auto-start (0) counts as unset
+  const raw = (await listTracks()).find((t) => t.id === els.sel.value);
+  const t = raw ? sanitizeTrack(raw) : null;
+  if (!t || t.centerline.length < 2) { say('Saved track is corrupt — cannot load.'); return; }
+  track = { ...t };
+  track.closed = raw!.closed ?? dist(track.centerline[0], track.centerline[track.centerline.length - 1]) < 60;
   pieces = [t.centerline.map((p) => [...p] as Pt)]; active = 0; selectedGate = null;
   touchPieces();
   builtFor = { v: piecesVersion, active }; // verbatim: saved centerline needs no reprocessing
@@ -1789,7 +1856,7 @@ els.load.onclick = async () => {
   if (lb?.data && [lb.x, lb.y, lb.s].every(isFinite) && lb.s > 0) {
     loadImageEl(lb.data).then((img) => setBg(img, lb.data, lb.x, lb.y, lb.s)).catch(() => { /* bad image: track still loads */ });
   } else if (bg) clearBg(); // record has no underlay: don't show the previous track's
-  pushHistory(); pinOpenWidth(); refreshWidthCaps(); persist(); render(); say(`Loaded "${t.name}"`);
+  pushHistory(); pinOpenWidth(); refreshWidthCaps(); persist(); fitViewToContent(); say(`Loaded "${t.name}"`);
 };
 els.del.onclick = async () => { if (!els.sel.value) return; await deleteTrack(els.sel.value); await refreshList(); say('Deleted'); };
 els.exp.onclick = () => {
@@ -1804,11 +1871,13 @@ els.file.onchange = async () => {
   const f = els.file.files?.[0];
   if (!f) return;
   try {
-    const t = JSON.parse(await f.text()) as Track;
-    if (!t.centerline?.length) throw new Error('bad file');
-    track = { ...t, id: uid(), gates: t.gates ?? [], gateWidths: t.gateWidths ?? (t.gates ?? []).map(() => t.width) };
-    track.closed = t.closed ?? dist(track.centerline[0], track.centerline[track.centerline.length - 1]) < 60;
-    track.startS = !track.startS ? null : Math.min(track.startS, track.centerline.length - 1); // legacy auto-start (0) counts as unset
+    const raw = JSON.parse(await f.text()) as Track;
+    if (!raw?.centerline?.length) throw new Error('bad file');
+    const clean = sanitizeTrack(raw);
+    if (!clean) throw new Error('bad file');
+    const t = { ...clean, id: uid() };
+    t.closed = raw.closed ?? dist(t.centerline[0], t.centerline[t.centerline.length - 1]) < 60;
+    track = t;
     pieces = [track.centerline.map((p) => [...p] as Pt)]; active = 0; selectedGate = null;
     touchPieces();
     builtFor = { v: piecesVersion, active }; // verbatim: no reprocessing
@@ -1816,7 +1885,7 @@ els.file.onchange = async () => {
     if (fb?.data && [fb.x, fb.y, fb.s].every(isFinite) && fb.s > 0) {
       loadImageEl(fb.data).then((img) => setBg(img, fb.data, fb.x, fb.y, fb.s)).catch(() => { /* bad image: track still loads */ });
     }
-    pushHistory(); pinOpenWidth(); refreshWidthCaps(); refreshList(); say(`Imported (${track.centerline.length} pts)`);
+    pushHistory(); pinOpenWidth(); refreshWidthCaps(); refreshList(); fitViewToContent(); say(`Imported (${track.centerline.length} pts)`);
   } catch { say('Import failed: invalid track JSON'); }
   els.file.value = '';
 };
@@ -1879,7 +1948,7 @@ gid('btn-import-img').onclick = () => gid('file-image').click();
   if (!f) return;
   try {
     say('Tracing image…');
-    const loop = await traceImageFile(f, canvas.width, canvas.height);
+    const loop = await traceImageFile(f, 960, 600); // frozen world: imports land in fixed world units, same at any window size
     if (loop.length < 8) { say('No track found — need one-color circuit on plain background.'); return; }
     // auto-clear: drop the doodle, its gates/start and tool state, and bump the
     // pieces version — without touchPieces the rebuild below reuses the old
@@ -1889,7 +1958,7 @@ gid('btn-import-img').onclick = () => gid('file-image').click();
     track = null;
     touchPieces();
     els.width.value = '60'; els.widthVal.textContent = '60'; // fresh closed track: standard default (caps still apply)
-    view = { s: 1, ox: 0, oy: 0 }; saveView(view); // traced loop is fit to canvas px: identity view shows it
+    fitViewToContent(); // frame the import at any window size (also saves the view)
     commit(); say(`Traced ${loop.length} pts — set width, checkpoints, start.`);
   } catch { say('Image import failed.'); }
 };
@@ -1945,7 +2014,7 @@ async function traceImageFile(f: File, cw: number, ch: number): Promise<Pt[]> {
       raw = traceLoop(comp, gw, gh);
     }
     if (raw.length < 8) return [];
-    // fit track bbox into canvas with margin
+    // fit track bbox into the fixed world box (cw/ch) with margin
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const [x, y] of raw) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
     const m = 40, s = Math.min((cw - 2 * m) / Math.max(1, x1 - x0), (ch - 2 * m) / Math.max(1, y1 - y0));
@@ -1958,30 +2027,24 @@ async function refreshList() {
   const ts = await listTracks();
   els.sel.innerHTML = ts.map((t) => `<option value="${t.id}">${t.name} (${t.centerline.length}pts)</option>`).join('');
 }
-// Canvas fills its flex container: backing store tracks CSS size, stored
-// geometry scales proportionally (incl. undo history, so undo stays valid).
-// Space the stored pieces live in. Fresh sessions start at the canvas attrs;
-let spaceW = 0, spaceH = 0;
+// Canvas fills its flex container: backing store tracks CSS size, but the world
+// is frozen — resizing never rewrites geometry (pieces, track, widths, caps,
+// physics all stay window-independent). The VIEW follows the canvas instead,
+// so on-screen framing is preserved; only newly revealed space differs.
+let prevCW = 0, prevCH = 0; // last canvas backing size: the view follows growth/shrink, never the geometry
 async function fitCanvas() {
   const r = canvas.getBoundingClientRect();
   const w = Math.max(50, Math.round(r.width)), h = Math.max(50, Math.round(r.height));
-  if (!spaceW) {
-    // stored pieces remember their own space; legacy drafts assumed 960x600
-    const d = await loadPieces();
-    spaceW = d?.w ?? 960; spaceH = d?.h ?? 600;
-  }
-  if (w !== canvas.width || h !== canvas.height) {
-    const sx = w / spaceW, sy = h / spaceH; // 1.0 when reopening at same window: no-op
-    spaceW = w; spaceH = h;
-    view.ox *= sx; view.oy *= sy; // pan follows the resize
-    if (sx !== 1 || sy !== 1) {
-      const sc = (ps: Pt[][]) => { for (const pc of ps) for (const p of pc) { p[0] *= sx; p[1] *= sy; } };
-      sc(pieces);
-      for (const hs of history) sc(hs.pieces);
-      if (track) for (const p of track.centerline) { p[0] *= sx; p[1] *= sy; } // keep prev-center in post-scale space for world-anchoring
-      touchPieces(); // scaled geometry must rebuild once
-      drawing = null; lineStart = null; hover = null;
+  if (w !== canvas.width || h !== canvas.height || !prevCW) {
+    if (prevCW > 0 && prevCH > 0 && (w !== prevCW || h !== prevCH)) {
+      // follow the axis that moved most (ties → width): backward ratios are
+      // reciprocals, so the same axis is picked both ways and round trips
+      // compose to exactly 1. min()/max() here decayed or ballooned the view.
+      const wr = w / prevCW, hr = h / prevCH;
+      const k = Math.abs(Math.log(wr)) >= Math.abs(Math.log(hr)) ? wr : hr;
+      if (Number.isFinite(k) && k > 0) { view.s *= k; view.ox *= k; view.oy *= k; saveView(view); }
     }
+    prevCW = w; prevCH = h;
     canvas.width = w; canvas.height = h;
   }
   rebuildTrack();
@@ -1994,7 +2057,8 @@ window.addEventListener('resize', () => { window.clearTimeout(sessT); sessT = wi
 async function boot() {
   await storeReady();
   const v = await loadView();
-  if (v) view = v;
+  if (v && Number.isFinite(v.s) && v.s >= 0.05 && v.s <= 50 && Number.isFinite(v.ox + v.oy)) view = v;
+  else if (v) { view = { s: 1, ox: 0, oy: 0 }; saveView(view); } // poisoned view (decayed/NaN): reset instead of restoring a blank screen
   await bootRestore();
   await refreshList();
   teams = await loadTeams(); renderTeams();

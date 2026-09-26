@@ -25,7 +25,8 @@ export type Control = [throttle: number, brake: number, steer: number]; // [0,1]
 export interface TrackIndex {
   track: Track; n: number; pts: Pt[]; cum: number[]; total: number;
   left: Pt[]; right: Pt[]; gates: Pt[]; gateFr: number[];
-  grid: Map<string, number[]>; cell: number;
+  gateOrder: { fr: number; g: Pt }[]; // gates sorted by arc fraction (binary-searched per step)
+  grid: Map<number, number[]>; cell: number;
 }
 
 // Precompute per track: arc lengths, edges, gate midpoints, edge-segment grid.
@@ -40,14 +41,14 @@ export function makeTrackIndex(track: Track): TrackIndex {
   const gates = checkpoints(track).map((g) => [(g.a[0] + g.b[0]) / 2, (g.a[1] + g.b[1]) / 2] as Pt);
   const gateFr = (track.gates ?? []).slice();
   const cell = 32;
-  const grid = new Map<string, number[]>();
-  const key = (x: number, y: number) => `${Math.floor(x / cell)},${Math.floor(y / cell)}`;
+  const grid = new Map<number, number[]>();
+  const key = (cx: number, cy: number) => cx * 65536 + cy; // cell indices: |cy| << 32768
   const addSeg = (a: Pt, b: Pt, id: number) => {
     const x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]);
     const y0 = Math.min(a[1], b[1]), y1 = Math.max(a[1], b[1]);
     for (let cx = Math.floor(x0 / cell); cx <= Math.floor(x1 / cell); cx++)
       for (let cy = Math.floor(y0 / cell); cy <= Math.floor(y1 / cell); cy++) {
-        const k = `${cx},${cy}`;
+        const k = key(cx, cy);
         let arr = grid.get(k);
         if (!arr) grid.set(k, (arr = []));
         arr.push(id);
@@ -57,7 +58,10 @@ export function makeTrackIndex(track: Track): TrackIndex {
     addSeg(left[i], left[(i + 1) % n], i);
     addSeg(right[i], right[(i + 1) % n], n + i);
   }
-  return { track, n, pts, cum, total: cum[n], left, right, gates, gateFr, grid, cell };
+  const gateOrder = gates
+    .map((g, i) => ({ fr: gateFr[i] ?? i / Math.max(1, gates.length), g }))
+    .sort((a, b) => a.fr - b.fr);
+  return { track, n, pts, cum, total: cum[n], left, right, gates, gateFr, gateOrder, grid, cell };
 }
 
 export interface Located { s: number; frac: number; dist: number; tx: number; ty: number; hw: number; cx: number; cy: number; bi: number }
@@ -128,7 +132,7 @@ function rayHit(idx: TrackIndex, x: number, y: number, dx: number, dy: number): 
   const segs = new Set<number>();
   let step = 0;
   for (let d = 0; d < RAY_RANGE; d += 8, step++) {
-    const k = `${Math.floor((x + dx * d) / idx.cell)},${Math.floor((y + dy * d) / idx.cell)}`;
+    const k = Math.floor((x + dx * d) / idx.cell) * 65536 + Math.floor((y + dy * d) / idx.cell);
     const arr = idx.grid.get(k);
     if (arr) for (const id of arr) segs.add(id);
   }
@@ -151,14 +155,12 @@ function rayHit(idx: TrackIndex, x: number, y: number, dx: number, dy: number): 
 // Flat 16-dim observation: speed, lateral offset, heading error, 9 edge rays,
 // angle+dist to the next 2 gate midpoints. Normalized per initial_plan.
 function nextGate(idx: TrackIndex, frac: number, k: number): Pt {
-  const n = idx.gates.length;
-  if (!n) return [idx.pts[0][0], idx.pts[0][1]];
-  const cands = idx.gates.map((g, i) => ({
-    g,
-    d: ((((idx.gateFr[i] ?? i / n) - frac) % 1 + 1) % 1) || 1, // 0 = just passed → full lap
-  }));
-  cands.sort((a, b) => a.d - b.d);
-  return cands[Math.min(k - 1, cands.length - 1)].g;
+  const ord = idx.gateOrder;
+  if (!ord.length) return [idx.pts[0][0], idx.pts[0][1]];
+  // first gate strictly ahead (a gate exactly at frac counts as just passed → full lap)
+  let lo = 0, hi = ord.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (ord[m].fr <= frac) lo = m + 1; else hi = m; }
+  return ord[(lo + k - 1) % ord.length].g;
 }
 
 const wrapAngle = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
@@ -209,6 +211,7 @@ export async function runEpisode(
     if (loc.dist > loc.hw) return { progress: prog, time, steps, done: 'crash' };
     if (prog >= laps) return { progress: prog, time, steps, done: 'lap' };
     if (time >= maxTime) return { progress: prog, time, steps, done: 'timeout' };
+    if (time > 8 && prog < 0.02) return { progress: prog, time, steps, done: 'crash' }; // stalled: parked or crawling, don't burn the full timeout
     stepCar(car, policy(observe(idx, car, loc), car), phys);
     time += DT;
     steps++;
