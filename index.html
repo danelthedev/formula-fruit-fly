@@ -125,9 +125,78 @@
         </section>
       </div>
     </section>
-    <section id="view-placeholder" hidden>
-      <h2 id="placeholder-title">My Teams</h2>
-      <p>Page under construction — check back later.</p>
+    <section id="view-races" hidden>
+      <div id="race-landing">
+        <h2>Races</h2>
+        <div class="row">
+          <button id="btn-race-single">Single race</button>
+          <button id="btn-race-champ">Championship</button>
+        </div>
+      </div>
+      <div id="race-setup" hidden>
+        <h2>Single race setup</h2>
+        <label>Track <select id="sel-race-track"></select></label>
+        <div id="race-teams"></div>
+        <label>Drivers per team <input id="in-race-drivers" type="number" min="1" max="4" value="2" /></label>
+        <label>Laps <input id="in-race-laps" type="number" min="1" max="10" value="3" /></label>
+        <div class="row">
+          <button id="btn-race-begin">Begin practice</button>
+          <button id="btn-race-setup-back">Back</button>
+        </div>
+        <p class="hint" id="race-setup-hint"></p>
+      </div>
+      <div id="race-practice" hidden>
+        <h2>Practice</h2>
+        <p id="race-practice-summary"></p>
+        <div class="row">
+          <label>Population <input id="in-ga-pop" type="number" min="4" max="256" value="64" /></label>
+          <label>Mutation σ <input id="in-ga-sigma" type="number" min="0.005" max="0.5" step="0.005" value="0.05" /></label>
+          <label>Preview every <input id="in-ga-preview" type="number" min="0" max="50" value="0" /> epochs</label>
+        </div>
+        <div id="practice-teams"></div>
+        <div class="row">
+          <button id="btn-start-quali" disabled>Start Qualifying</button>
+          <button id="btn-preview-now">Current Epoch Preview</button>
+          <button id="btn-practice-back">Back to setup</button>
+        </div>
+        <p class="hint" id="practice-hint"></p>
+        <input id="file-weights" type="file" accept="application/json" hidden />
+      </div>
+      <div id="race-quali" hidden>
+        <h2>Qualifying</h2>
+        <div class="session-wrap">
+          <canvas id="quali-canvas"></canvas>
+          <aside class="session-side">
+            <h3>Leaderboard</h3>
+            <ul id="quali-board" class="board"></ul>
+            <div class="row">
+              <button id="btn-start-race" disabled>Start race</button>
+              <button id="btn-quali-back">Back to practice</button>
+            </div>
+          </aside>
+        </div>
+        <p class="hint" id="race-last-results"></p>
+      </div>
+      <div id="race-race" hidden>
+        <h2>Race</h2>
+        <div class="session-wrap">
+          <canvas id="race-canvas"></canvas>
+          <aside class="session-side">
+            <h3 id="race-lap">Lap 1/1</h3>
+            <ul id="race-board" class="board"></ul>
+            <div class="row">
+              <button id="btn-race-back">Back to qualifying</button>
+            </div>
+          </aside>
+        </div>
+      </div>
+      <div id="race-champ" hidden>
+        <h2>Championship</h2>
+        <p>Page under construction — check back later.</p>
+        <div class="row">
+          <button id="btn-race-champ-back">Back</button>
+        </div>
+      </div>
     </section>
   </div>
   <script type="module" src="/src/main.ts"></script>

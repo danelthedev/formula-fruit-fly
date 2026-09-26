@@ -66,11 +66,13 @@ Fixed timestep dt = 1/60, seeded RNG (deterministic replays/tests).
 - Fitness: gate progress + fractional s, small speed bonus, crash/time penalties.
 - Config inputs (practice panel, with defaults): population, mutation σ,
   preview-every-X. Episodes fixed at 3 (not exposed v1).
-- Weights: per-team best (all-time) + per-epoch best (for previews).
+- Weights: per-team best (all-time) + per-epoch best (for previews) + the FULL
+  final-epoch population (for quali/race rosters — see driver sampling below).
 
 ## 5. Storage (extends `src/storage.ts` kv store, IndexedDB)
 
 - `rs.v1.weights.<teamId>` — best weights per team (TF.js JSON: topology + arrays).
+- `rs.v1.population.<teamId>` — final-epoch population weights per team (~64 nets).
 - `rs.v1.racecfg` — last single-race setup (track id, team ids, drivers, laps, X).
 - `rs.v1.racesession` — session snapshot (stage, quali board, results) for reload.
 - Weights files: `{ teamId, teamName, topology, weights }` JSON export/import.
@@ -112,12 +114,16 @@ Fixed timestep dt = 1/60, seeded RNG (deterministic replays/tests).
    DoD: board orders finishers by time, DNFs by progress; reload keeps board.
    Test: position-sort fn on fixture (stories.md DoD).
 8. **Grid + race** — F1-stagger spawn, mass start, live positions, lap times,
-   DNF removal, results table + session persist. DoD: 2 teams × 2 drivers × 2 laps
-   completes with correct winner; reload keeps results. E2E: scripted short race.
+   DNF removal, results table + session persist. DoD: 2 teams × 2 drivers (sampled
+   from each team's final-epoch population, seeded) × 2 laps completes with correct
+   winner; reload keeps results. E2E: scripted short race.
 
 ## 8. Open decisions (defaults in place; revisit on feedback)
 
 - Preview fleets show current-epoch bests (manual = best-so-far).
+- Driver sampling (user request): quali/race rosters draw N drivers per team as a
+  SEEDED random sample from that team's final-epoch population — not clones of the
+  best — so drivers differ; same event seed reproduces the same roster.
 - Episodes/epoch fixed at 3; expose only population/σ/X.
 - Back-to-setup keeps weights, drops session progress.
 - Timeout 3× expected lap; expected = centerline length / (0.8 × fastest vMax).

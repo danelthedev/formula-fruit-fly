@@ -1,4 +1,4 @@
-import type { Pt } from './track';
+import type { Pt } from './track.ts';
 
 // Raster track image → ordered centerline loop. Pure functions over pixel masks
 // (no DOM); main.ts handles file loading, canvas raster and coordinate mapping.

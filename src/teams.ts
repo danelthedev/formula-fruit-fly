@@ -1,4 +1,4 @@
-import type { Pt } from './track';
+import type { Pt } from './track.ts';
 
 // ---- Team model (Story 2: Team Configurer) ----
 export interface Team {
