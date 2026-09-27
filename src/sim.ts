@@ -5,7 +5,7 @@ import type { PhysicsParams } from './teams.ts';
 // ---- Shared fixed-timestep sim core (Stories 3-4: practice, quali, race) ----
 // Arcade bicycle-ish model, dt = 1/60, seeded RNG for deterministic replays.
 export const DT = 1 / 60;
-const WHEELBASE = 4; // px: min turn radius = WB/tan(steerMax) ≈ 21/12/7px across specs — must clear ~11px kink apexes; 6px gated them behind high specs
+const WHEELBASE = 6; // px ≈ 2m at ~3px/m; with steerMax R_min ≈ 22/12/7px across specs — clears ~9px drawn kinks
 const RAY_RANGE = 300; // px, sensor normalization
 const RAY_COUNT = 9; // over ±90°
 
@@ -156,7 +156,11 @@ export function stepCar(car: CarState, c: Control, p: PhysicsParams): void {
   car.vy = fy * vf + fx * vl;
   car.x += car.vx * DT;
   car.y += car.vy * DT;
-  car.heading += ((vf / WHEELBASE) * Math.tan(str * p.steerMax)) * DT;
+  // Grip-limited yaw: bicycle geometry at crawl speed (tight lock for drawn kinks),
+  // capped by lateral tire grip at pace — no pirouettes, corner speed limits exist.
+  const yawBike = (vf / WHEELBASE) * Math.tan(str * p.steerMax);
+  const yawMax = vf > 1 ? p.latA / vf : Infinity;
+  car.heading += Math.max(-yawMax, Math.min(yawMax, yawBike)) * DT;
 }
 
 function rayHit(idx: TrackIndex, x: number, y: number, dx: number, dy: number): number {

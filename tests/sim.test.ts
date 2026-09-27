@@ -96,10 +96,11 @@ test('curvature CDF built; corner-biased spawns stay in range and deterministic'
 
 test('spawnAt sets rolling velocity along the tangent; coasting covers ground', async () => {
   const idx = makeTrackIndex(oval());
-  const s = spawnAt(idx, 0.1, 150);
-  assert.equal(Math.round(Math.hypot(s.car.vx, s.car.vy)), 150);
+  const s = spawnAt(idx, 0.1, 60);
+  assert.equal(Math.round(Math.hypot(s.car.vx, s.car.vy)), 60);
   // parked policy coasts from speed before stalling: progress without throttle
-  const r = await runEpisode(idx, phys, () => [0, 0, 0], { laps: 1, maxTime: 3, spawnFrac: 0.1, spawnSpeed: 150 });
+  // (60px/s: drag brings it to rest on the straight; faster would carry it off)
+  const r = await runEpisode(idx, phys, () => [0, 0, 0], { laps: 1, maxTime: 3, spawnFrac: 0.1, spawnSpeed: 60 });
   assert.ok(r.progress > 0.005, `coasted prog=${r.progress}`);
   assert.equal(r.done, 'timeout');
 });
@@ -127,7 +128,8 @@ test('hairpin track (R=30, tighter than Bahrain) is kinematically lappable', asy
     const err = wrap(Math.atan2(tp[1] - car.y, tp[0] - car.x) - car.heading);
     const steer = Math.max(-1, Math.min(1, err * 3));
     const v = Math.hypot(car.vx, car.vy);
-    return [v < 120 ? 1 : 0, v > 120 ? 0.8 : 0, steer];
+    // real rates: brake for the R=30 hairpins (corner speed ≈ 60px/s), back on power after
+    return [v < 55 ? 1 : 0, v > 70 ? 0.8 : 0, steer];
   }, { laps: 1, maxTime: 60 });
   assert.equal(r.done, 'lap');
 });

@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { blankTeam, physicsFor } from '../src/teams.ts';
 import type { Track } from '../src/track.ts';
 import { buildNet, decodeWeightsFile, encodeWeightsFile, forwardGenome, GENOME_SIZE, mutateGenome, NET_ARCH, withBrakeBias } from '../src/nn.ts';
-import { adaptSigma, crossover, epochTimeout, fitnessOf, initPop, migrateIslands, restartPop, runEpoch } from '../src/ga.ts';
+import { adaptSigma, aggregateEpisodes, crossover, epochTimeout, fitnessOf, initPop, migrateIslands, restartPop, runEpoch } from '../src/ga.ts';
 import { makeTrackIndex } from '../src/sim.ts';
 import { mulberry32 } from '../src/sim.ts';
 
@@ -44,6 +44,7 @@ test('mini GA epoch runs headless (no TF.js)', async () => {
   const pop = initPop(net, 4, 11);
   const r = await runEpoch(idx, phys, pop, {
     popSize: 4, elite: 1, sigma: 0.1, episodes: 1, timeout: 4, laps: 1,
+    crossoverRate: 0.7, robust: false,
   }, 5);
   assert.equal(r.pop.length, 4);
   assert.ok(Number.isFinite(r.bestFitness) && Number.isFinite(r.avgFitness));
@@ -62,6 +63,27 @@ test('mini GA epoch runs headless (no TF.js)', async () => {
     fitnessOf({ progress: 0.195, time: 3.6, steps: 216, done: 'crash', endSpeed: 200, decel: 0 }) >
     fitnessOf({ progress: 0.26, time: 36, steps: 2160, done: 'crash', endSpeed: 25, decel: 5 }),
   );
+});
+
+test('aggregateEpisodes: mean rewards peaks, worst-episode rewards consistency', () => {
+  assert.equal(aggregateEpisodes([100, 200, 300], false), 200);
+  assert.equal(aggregateEpisodes([100, 200, 300], true), 100);
+  assert.equal(aggregateEpisodes([250, 250, 250], true), 250); // steady lapper unaffected
+  assert.equal(aggregateEpisodes([], true), -Infinity);
+});
+
+test('finalize config (robust, no crossover, deep eval) runs headless', async () => {
+  const net = buildNet();
+  const idx = makeTrackIndex(oval());
+  const pop = initPop(net, 4, 11);
+  const r = await runEpoch(idx, phys, pop, {
+    popSize: 4, elite: 1, sigma: 0.01, episodes: 4, timeout: 4, laps: 1,
+    crossoverRate: 0, robust: true,
+  }, 5);
+  assert.equal(r.pop.length, 4);
+  assert.ok(Number.isFinite(r.bestFitness) && Number.isFinite(r.avgFitness));
+  assert.ok(r.bestFitness >= r.avgFitness);
+  assert.equal(r.partial, false);
 });
 
 test('weights file round-trip identical; invalid decodes null', async () => {
@@ -99,8 +121,8 @@ test('restartPop keeps a champion copy plus mutated diversity; epochTimeout scal
   assert.ok(pop[0] !== best, 'copy, not alias');
   assert.ok(pop.some((g) => g.some((v, i) => v !== best[i])), 'mutants differ');
   assert.equal(epochTimeout(1000, 1), 40); // small track: floor
-  assert.equal(epochTimeout(2700, 1), 54); // big track scales (learning pace)
-  assert.equal(epochTimeout(2700, 2), 108); // multi-lap scales
+  assert.equal(epochTimeout(2800, 1), 80); // big track scales (learning pace)
+  assert.equal(epochTimeout(2800, 2), 150); // multi-lap scales (capped)
   assert.equal(epochTimeout(20000, 1), 150); // ceiling
   assert.equal(epochTimeout(0, 1), 40); // degenerate guard
 });

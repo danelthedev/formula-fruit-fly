@@ -1,7 +1,7 @@
 import { buildMask, extractCore, largestComponent, prune, simplifySkeleton, thin, traceLoop } from './skeleton.ts';
 import { blendSeam, checkpoints, closeLoop, dist, distToTrack, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, sanitizePoints, sanitizeTrack, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths, widthAt } from './track.ts';
 import type { Pt, Track } from './track.ts';
-import { deleteTrack, listTracks, loadBg, loadDraft, loadPieces, loadPopulation, loadRaceCfg, loadRaceSession, loadTeams, loadView, loadWeights, ready as storeReady, saveBg, saveDraft, savePieces, savePopulation, saveRaceCfg, saveRaceSession, saveTeams, saveTrack, saveView, saveWeights } from './storage.ts';
+import { deleteTrack, deleteWeights, listTracks, loadBg, loadDraft, loadPieces, loadPopulation, loadRaceCfg, loadRaceSession, loadTeams, loadView, loadWeights, ready as storeReady, saveBg, saveDraft, savePieces, savePopulation, saveRaceCfg, saveRaceSession, saveTeams, saveTrack, saveView, saveWeights } from './storage.ts';
 import { adaptSigma, epochTimeout, initPop, migrateIslands, restartPop, runEpoch } from './ga.ts';
 import { buildNet, decodeWeightsFile, encodeWeightsFile, forwardGenome, mutateGenome, randomGenome, withBrakeBias } from './nn.ts';
 import type { EpochResult, GAConfig } from './ga.ts';
@@ -219,6 +219,32 @@ function rebuildTrack(): boolean {
 function commit() {
   if (rebuildTrack()) pushHistory();
 }
+
+// Racing direction: signed area of the loop (canvas y-down, so positive reads
+// clockwise on screen). Reversing the stroke flips travel; start line and
+// checkpoints ride along as world geography through the normal rebuild.
+function signedArea(pts: Pt[]): number {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], q = pts[(i + 1) % pts.length];
+    a += p[0] * q[1] - q[0] * p[1];
+  }
+  return a / 2;
+}
+let lastDirection = '';
+function refreshDirection() {
+  const pts = track?.centerline;
+  const d = !track?.closed || !pts || pts.length < 8 ? '' : signedArea(pts) >= 0 ? 'clockwise' : 'counter-clockwise';
+  if (d !== lastDirection) { lastDirection = d; gid('track-direction').textContent = d || '—'; }
+  (gid('btn-reverse') as HTMLButtonElement).disabled = !d;
+}
+gid('btn-reverse').onclick = () => {
+  if (!track?.closed || !pieces[active]?.length) return;
+  pieces[active] = pieces[active].slice().reverse();
+  touchPieces();
+  if (rebuildTrack()) { pushHistory(); say(`Direction reversed — now running ${lastDirection}.`); }
+  // rejection restores last-good geometry (with its direction) inside rebuildTrack
+};
 
 // ---- endpoints: snap + merge ----
 interface Ep { p: Pt; piece: number; end: 'head' | 'tail' }
@@ -692,6 +718,7 @@ function render() {
     const b = document.getElementById(id);
     if (b && (b as HTMLButtonElement).disabled !== off) (b as HTMLButtonElement).disabled = off;
   }
+  refreshDirection();
   validate();
 }
 
@@ -857,6 +884,7 @@ function setRacePane(p: RacePane) {
     .forEach(([id, vv]) => (gid(id) as HTMLElement).hidden = vv !== p);
   if (p === 'quali') { fitSessionCanvas(gid('quali-canvas') as HTMLCanvasElement); if (qualiIdx && !quali?.running) drawQualiScene([]); }
   if (p === 'race') { fitSessionCanvas(gid('race-canvas') as HTMLCanvasElement); if (raceIdx && !raceRunning) drawRaceSceneOnCanvas(); }
+  if (p === 'practice') { fitSessionCanvas(gid('practice-canvas') as HTMLCanvasElement); if (practiceIdx && !previewRunning && session) drawPracticeScene(); }
 }
 async function renderRaces() {
   setRacePane(racePane);
@@ -881,21 +909,93 @@ async function renderRaces() {
   const checked = new Set(raceCfg?.teamIds.length ? raceCfg.teamIds : teams.map((t) => t.id));
   if (!teams.length) box.textContent = '(no teams — configure some first)';
   for (const t of teams) {
-    const lab = document.createElement('label');
-    lab.className = 'race-teamrow';
+    const row = document.createElement('div');
+    row.className = 'race-teamrow';
     const cb = document.createElement('input');
     cb.type = 'checkbox'; cb.value = t.id; cb.checked = checked.has(t.id);
     const sw = document.createElement('span');
     sw.className = 'swatch'; sw.style.background = t.primary;
     const nm = document.createElement('span');
     nm.textContent = t.name;
+    const lab = document.createElement('label');
     lab.append(cb, sw, nm);
-    box.appendChild(lab);
+    const exp = document.createElement('button');
+    exp.textContent = 'Export';
+    exp.title = 'Download this team\u2019s saved weights';
+    exp.onclick = () => { void exportTeamWeights(t.id); };
+    const imp = document.createElement('button');
+    imp.textContent = 'Import';
+    imp.title = 'Load a weights file as this team\u2019s saved best';
+    imp.onclick = () => { weightsImportTarget = t.id; gid('file-weights').click(); };
+    const clr = document.createElement('button');
+    clr.textContent = 'Clear';
+    clr.title = 'Forget this team\u2019s saved weights (retrain from scratch)';
+    clr.onclick = () => { void clearTeamWeights(t.id); };
+    row.append(lab, exp, imp, clr);
+    box.appendChild(row);
   }
   (gid('in-race-drivers') as HTMLInputElement).value = String(raceCfg?.drivers ?? 2);
   (gid('in-race-laps') as HTMLInputElement).value = String(raceCfg?.laps ?? 3);
   gid('race-setup-hint').textContent = '';
+  (gid('sel-race-track') as HTMLSelectElement).onchange = () => { void updateSkipButton(); };
+  gid('race-teams').onchange = () => { void updateSkipButton(); };
+  void updateSkipButton();
 }
+
+// Skip-to-qualifying: enabled when every checked team has saved weights.
+// Weights are per-team, not per-track — skipping onto a new track races on
+// transferred skill, which may drive worse than track-trained weights.
+async function updateSkipButton() {
+  const btn = gid('btn-race-skip') as HTMLButtonElement;
+  const teamIds = [...gid('race-teams').querySelectorAll<HTMLInputElement>('input:checked')].map((cb) => cb.value);
+  const trackId = (gid('sel-race-track') as HTMLSelectElement).value;
+  btn.disabled = true;
+  if (!trackId || !teamIds.length) return;
+  for (const id of teamIds) {
+    const w = await loadWeights(id);
+    if (!w) return; // one weightless team: train first
+  }
+  btn.disabled = false;
+}
+
+// Weights backup on the setup rows: export downloads saved weights, import
+// stores a file as the team's saved best (picked up by the next session).
+// Forget a team's saved weights + population: the next session starts from scratch.
+async function clearTeamWeights(teamId: string) {
+  const team = teams.find((t) => t.id === teamId);
+  const name = team?.name ?? 'team';
+  if (!await loadWeights(teamId)) { say(`${name} has no saved weights to clear.`); return; }
+  if (!window.confirm(`Forget ${name}'s saved weights and retrain from scratch?`)) return;
+  await deleteWeights(teamId);
+  say(`${name}'s saved weights cleared — next session starts from scratch.`);
+  void updateSkipButton();
+}
+
+async function exportTeamWeights(teamId: string) {
+  const team = teams.find((t) => t.id === teamId);
+  const w = await loadWeights(teamId);
+  if (!w || !team) { say('No saved weights to export yet — train first.'); return; }
+  const blob = new Blob([JSON.stringify(w, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `weights-${team.name}.json`; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+(gid('file-weights') as HTMLInputElement).onchange = async (e) => {
+  const f = (e.target as HTMLInputElement).files?.[0];
+  (e.target as HTMLInputElement).value = '';
+  const target = weightsImportTarget;
+  weightsImportTarget = null;
+  if (!f || !target) return;
+  if (!practiceNet) practiceNet = buildNet();
+  try {
+    const wf = decodeWeightsFile(JSON.parse(await f.text()), practiceNet.size);
+    if (!wf) { say('Import failed: bad weights file.'); return; }
+    await saveWeights(target, wf);
+    await savePopulation(target, []); // stale pop would shadow the import: session rebuilds from best
+    say(`Weights imported for ${teams.find((t) => t.id === target)?.name ?? 'team'} — next session starts from them.`);
+  } catch { say('Import failed: invalid weights JSON'); }
+};
 // ---- practice session (Story 3, subtask 5) ----
 interface Island {
   pop: Float32Array[];
@@ -915,17 +1015,14 @@ interface TeamTrain {
   best: Float32Array | null; // best island best (fairly crowned)
   bestFit: number;
   lastAvg: number;
-  histBest: number[];
-  histAvg: number[];
   sigma: number | null;
   stasis: number;
   islands: Island[];
   hof: { genome: Float32Array; fitness: number; epoch: number } | null; // hall of fame: best confirmed champion ever
   migAt: number; // max island epoch at last migration
-  card?: { status: HTMLElement; stat: HTMLElement; canvas: HTMLCanvasElement; toggle: HTMLButtonElement; exp: HTMLButtonElement };
+  finalize: boolean; // consolidate mode: frozen sigma, no crossover/immigrants, worst-episode selection
 }
 let practiceTeams: TeamTrain[] = [];
-let seedDonors: { id: string; name: string; weights: Float32Array }[] = []; // teams with saved weights: transfer-learning donors
 let practiceNet: GenomeNet | null = null;
 let practiceIdx: TrackIndex | null = null;
 let weightsImportTarget: string | null = null;
@@ -945,7 +1042,7 @@ function practiceCfg(): GAConfig {
     popSize,
     elite: Math.min(4, Math.max(1, popSize - 1)),
     sigma: Math.min(0.5, Math.max(0.005, num('in-ga-sigma', 0.05))),
-    episodes: 2, timeout: 20, laps: 1,
+    episodes: 2, timeout: 20, laps: 1, crossoverRate: 0.7, robust: false,
   };
 }
 
@@ -978,25 +1075,6 @@ function resetRaceSession() {
 
 function fmtFit(f: number) { return Number.isFinite(f) ? f.toFixed(0) : '—'; }
 
-function spark(cv: HTMLCanvasElement, best: number[], avg: number[]) {
-  const c = cv.getContext('2d')!;
-  const W = cv.width, H = cv.height;
-  c.clearRect(0, 0, W, H);
-  const all = [...best, ...avg].filter(Number.isFinite);
-  if (!all.length) return;
-  let lo = Math.min(...all), hi = Math.max(...all);
-  if (hi - lo < 1e-6) { lo -= 1; hi += 1; }
-  const line = (arr: number[], col: string) => {
-    c.strokeStyle = col; c.lineWidth = 1.5; c.beginPath();
-    arr.forEach((v, i) => {
-      const x = arr.length < 2 ? 2 : (i / (arr.length - 1)) * (W - 4) + 2;
-      const y = H - 4 - ((v - lo) / (hi - lo)) * (H - 8);
-      if (i) c.lineTo(x, y); else c.moveTo(x, y);
-    });
-    c.stroke();
-  };
-  line(avg, '#666'); line(best, '#0f0');
-}
 
 async function enterPractice(): Promise<boolean> {
   if (!raceCfg) return false;
@@ -1036,114 +1114,142 @@ async function enterPractice(): Promise<boolean> {
         islands.push({ pop: initPop(net, cfg.popSize, (Math.random() * 2 ** 31) | 0), best: null, bestFit: -Infinity, sigma: null, stasis: 0, seed: (Math.random() * 2 ** 31) | 0, epoch: 0, lastAvg: NaN });
       }
     }
-    practiceTeams.push({ teamId: id, status: best ? 'stopped' : 'idle', pop, epoch: 0, best: best ? best.slice() : null, bestFit: -Infinity, lastAvg: NaN, histBest: [], histAvg: [], sigma: null, stasis: 0, islands, hof: null, migAt: 0 });
-  }
-  seedDonors = [];
-  for (const t of teams) {
-    const w = await loadWeights(t.id);
-    if (w && w.weights.length === net.size) seedDonors.push({ id: t.id, name: t.name, weights: new Float32Array(w.weights) });
+    practiceTeams.push({ teamId: id, status: best ? 'stopped' : 'idle', pop, epoch: 0, best: best ? best.slice() : null, bestFit: -Infinity, lastAvg: NaN, sigma: null, stasis: 0, islands, hof: null, migAt: 0, finalize: false });
   }
   (gid('in-ga-preview') as HTMLInputElement).value = String(raceCfg.previewEvery ?? 0);
-  buildPracticeCards();
+  beginSession();
   updateQualiGate();
   return true;
 }
 
-function buildPracticeCards() {
-  const box = gid('practice-teams');
-  box.innerHTML = '';
-  for (const st of practiceTeams) {
-    const team = teams.find((t) => t.id === st.teamId)!;
-    const card = document.createElement('div');
-    card.className = 'practice-card';
-    const head = document.createElement('div');
-    head.className = 'prow';
-    const sw = document.createElement('span');
-    sw.className = 'swatch'; sw.style.background = team.primary;
-    const nm = document.createElement('strong');
-    nm.textContent = team.name;
-    const status = document.createElement('span');
-    status.className = 'stat';
-    head.append(sw, nm, status);
-    const stat = document.createElement('div');
-    stat.className = 'stat';
-    const cv = document.createElement('canvas');
-    cv.width = 220; cv.height = 60;
-    const row = document.createElement('div');
-    row.className = 'row';
-    const toggle = document.createElement('button');
-    toggle.textContent = 'Start';
-    toggle.onclick = () => toggleTeam(st.teamId);
-    const imp = document.createElement('button');
-    imp.textContent = 'Import weights';
-    imp.onclick = () => { weightsImportTarget = st.teamId; gid('file-weights').click(); };
-    const exp = document.createElement('button');
-    exp.textContent = 'Export weights';
-    exp.onclick = () => exportTeamWeights(st.teamId);
-    row.append(toggle, imp, exp);
-    card.append(head, stat, cv, row);
-    const donors = seedDonors.filter((d) => d.id !== st.teamId);
-    if (!st.best && donors.length) {
-      const srow = document.createElement('div');
-      srow.className = 'row';
-      const lab = document.createElement('span');
-      lab.className = 'stat';
-      lab.textContent = 'No weights — seed from';
-      const sel = document.createElement('select');
-      for (const d of donors) { const o = document.createElement('option'); o.value = d.id; o.textContent = d.name; sel.appendChild(o); }
-      const apply = document.createElement('button');
-      apply.textContent = 'Seed';
-      apply.title = 'Start as mutations of their trained weights. Driving skill transfers; training adapts it to this track.';
-      apply.onclick = () => { void seedFromDonor(st.teamId, sel.value); };
-      srow.append(lab, sel, apply);
-      card.append(srow);
-    }
-    box.appendChild(card);
-    st.card = { status, stat, canvas: cv, toggle, exp };
-  }
-  updatePracticeCards();
-}
 
-// Transfer learning: start a weightless team as mutations of another team's
-// trained weights. Driving skill transfers across tracks; further training
-// adapts it to this one.
-async function seedFromDonor(teamId: string, donorId: string) {
-  const st = practiceTeams.find((s) => s.teamId === teamId);
-  const donor = seedDonors.find((d) => d.id === donorId);
-  const team = teams.find((t) => t.id === teamId);
-  if (!st || !donor || !team || st.best) return;
-  const cfg = practiceCfg();
-  const b = donor.weights.slice();
-  reseedTeamIslands(st, b, cfg);
-  st.status = 'stopped';
-  const sb = st.best; // reseed just set it; guard for tsc
-  if (sb) {
-    await saveWeights(teamId, encodeWeightsFile(teamId, team.name, sb));
-    await savePopulation(teamId, st.pop.map((g) => [...g]));
+
+function updatePracticeCards() {
+  // Session view: phase switches, completion, epoch counter, live leaderboard.
+  const ses = session;
+  if (ses && !ses.done) {
+    for (const st of practiceTeams) {
+      if (st.status === 'training' && st.epoch >= ses.total) {
+        st.status = 'stopped'; // budgeted epochs done: rest while slower teams finish
+        for (let i = 0; i < st.islands.length; i++) { try { teamWorkers.get(`${st.teamId}:${i}`)?.postMessage({ type: 'stop' }); } catch { /* worker gone */ } }
+        continue;
+      }
+      if (st.status === 'training' && !st.finalize && st.epoch >= ses.exploreN) {
+        if ((st.bestFit ?? -Infinity) < 900 && ses.extended < 3) {
+          // no lap yet (laps score 1300+ everywhere): finalizing now would freeze
+          // around a non-lapper. Extend explore instead; the counter follows.
+          ses.exploreN += 10; ses.total += 10; ses.extended++;
+          say(`${teams.find((t) => t.id === st.teamId)?.name ?? 'Team'} hasn't lapped yet — exploring 10 more epochs first.`);
+        } else {
+          st.finalize = true;
+          for (const isl of st.islands) { isl.stasis = 0; isl.sigma = 0.01; }
+          const team = teams.find((t) => t.id === st.teamId);
+          say(`${team?.name ?? 'Team'} reached epoch ${ses.exploreN} — finalizing: σ frozen, worst-episode selection.`);
+        }
+      }
+    }
+    if (practiceTeams.length && practiceTeams.every((s) => s.epoch >= ses.total)) finishSession();
+    // Synced preview: fire once when the SLOWEST team reaches a preview epoch,
+    // so all teams watch one lap together instead of each triggering its own.
+    const X = raceCfg?.previewEvery ?? 0;
+    if (X > 0 && practiceTeams.length) {
+      const minEp = Math.min(...practiceTeams.map((s) => s.epoch));
+      if (minEp > 0 && minEp % X === 0 && minEp !== previewedAt) { previewedAt = minEp; previewHold = true; }
+    }
   }
-  say(`${team.name} seeded from ${donor.name} — skill transfers, training adapts it to this track.`);
-  buildPracticeCards();
+  const ep = practiceTeams.length ? Math.max(...practiceTeams.map((s) => s.epoch)) : 0;
+  const total = session?.total ?? 0;
+  gid('practice-title').textContent = session ? `Practice — Epoch ${Math.min(ep, total)}/${total}` : 'Practice';
+  renderPracticeBoard();
   updateQualiGate();
 }
 
-function updatePracticeCards() {
-  for (const st of practiceTeams) {
-    if (!st.card) continue;
-    st.card.status.textContent = st.status === 'training' ? `training · epoch ${st.epoch} (isl ${st.islands.map((s) => s.epoch).join('/')})` : st.status === 'idle' ? 'idle' : 'stopped · weights kept';
-    st.card.stat.textContent = `best ${fmtFit(st.bestFit)} · avg ${fmtFit(st.lastAvg)} · σ ${st.sigma != null ? st.sigma.toFixed(3) : '—'}` + (st.hof ? ` · hof ${fmtFit(st.hof.fitness)}` : '');
-    st.card.toggle.textContent = st.status === 'training' ? 'Stop' : 'Start';
-    st.card.exp.disabled = !st.best;
-    spark(st.card.canvas, st.histBest, st.histAvg);
-  }
+// ---- programmed practice session: explore N epochs, auto-finalize, done → quali ----
+interface Session { exploreN: number; total: number; done: boolean; extended: number }
+let session: Session | null = null; // null outside a programmed session (e.g. before Begin)
+
+function sessionCfg(): { exploreN: number; finalizeN: number } {
+  const num = (id: string, dflt: number) => {
+    const v = Number((gid(id) as HTMLInputElement).value);
+    return Number.isFinite(v) ? v : dflt;
+  };
+  return {
+    exploreN: Math.min(500, Math.max(10, Math.round(num('in-ga-explore', 80)))),
+    finalizeN: Math.min(200, Math.max(0, Math.round(num('in-ga-finalize', 30)))),
+  };
 }
 
-function toggleTeam(id: string) {
-  const st = practiceTeams.find((s) => s.teamId === id);
-  if (!st || !practiceIdx || !practiceNet) return;
-  if (st.status === 'training') { st.status = 'stopped'; for (let i = 0; i < st.islands.length; i++) { try { teamWorkers.get(`${id}:${i}`)?.postMessage({ type: 'stop' }); } catch { /* worker gone */ } } }
-  else { st.status = 'training'; updatePracticeCards(); void scheduler(); }
+// Hands-off session: every team trains from epoch 0 to total; explore flips to
+// finalize per team at exploreN; Start Quali unlocks when all teams finish.
+function beginSession() {
+  const { exploreN, finalizeN } = sessionCfg();
+  session = { exploreN, total: exploreN + finalizeN, done: false, extended: 0 };
+  previewedAt = -1;
+  for (const st of practiceTeams) { st.status = 'training'; st.finalize = false; }
+  say(`Practice: ${exploreN} explore + ${finalizeN} finalize epochs. Previews every ${raceCfg?.previewEvery ?? 0}.`);
+  updatePracticeCards();
+  drawPracticeScene();
+  void scheduler();
+}
+
+function finishSession() {
+  if (!session || session.done) return;
+  session.done = true;
+  stopPracticeAll();
+  stopAllWorkers();
+  say('Practice complete — qualifying is ready.');
   updatePracticeCards();
 }
+
+function renderPracticeBoard() {
+  const ul = gid('practice-board');
+  ul.innerHTML = '';
+  const ranked = practiceTeams.slice().sort((a, b) => (b.bestFit ?? -Infinity) - (a.bestFit ?? -Infinity));
+  ranked.forEach((st, i) => {
+    const team = teams.find((t) => t.id === st.teamId);
+    if (!team) return;
+    boardRow(ul, {
+      pos: `P${i + 1}`, mi: i, color: team.primary, team: team.name,
+      name: st.status === 'training' ? (st.finalize ? `ep ${st.epoch} · finalizing` : `ep ${st.epoch} · exploring`) : 'weights kept',
+      meta: `best ${fmtFit(st.bestFit)} · avg ${fmtFit(st.lastAvg)}`,
+    });
+  });
+}
+
+// Track background underlay (from the track record, if it has one): decoded once
+// per image, then drawn under the ribbon in world units — same placement as
+// the editor. Shared by practice, quali and race (same event track).
+let bgCache: { data: string; img: HTMLImageElement } | null = null;
+function trackBg(t: Track | null | undefined, onReady?: () => void): { img: HTMLImageElement; x: number; y: number; s: number } | null {
+  const b = t?.bg;
+  if (!b?.data) return null;
+  if (!bgCache || bgCache.data !== b.data) {
+    bgCache = null; // stale while the new image decodes
+    loadImageEl(b.data).then((img) => { bgCache = { data: b.data, img }; onReady?.(); }).catch(() => { /* bad image: track without underlay */ });
+    return null;
+  }
+  if (![b.x, b.y, b.s].every(isFinite) || b.s <= 0) return null;
+  return { img: bgCache.img, x: b.x, y: b.y, s: b.s };
+}
+function drawPracticeScene() {
+  if (!practiceIdx) return;
+  const cv = gid('practice-canvas') as HTMLCanvasElement;
+  fitSessionCanvas(cv);
+  const ctx = cv.getContext('2d')!;
+  const idx = practiceIdx;
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (racePane === 'practice' && !previewRunning) drawPracticeScene(); }));
+}
+
+// Session preview frame: same track, same size, same leaderboard — only the cars move.
+function drawPracticePreview() {
+  const idx = previewIdx!;
+  const cv = gid('practice-canvas') as HTMLCanvasElement;
+  const ctx = cv.getContext('2d')!;
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (previewRunning) drawPracticePreview(); }));
+  drawSessionCars(ctx, previewCars.map((g) => ({ x: g.car.x, y: g.car.y, heading: g.car.heading, primary: g.color, secondary: g.secondary, dim: g.done })), carSizeFor(idx.track.width));
+}
+
+
 
 // Central scheduler: teams train in parallel (one worker each), one epoch per
 // training team per round, so auto-previews and pause/resume stay coordinated.
@@ -1153,7 +1259,8 @@ let previewHold = false;
 let previewRunning = false;
 let previewAbort = false;
 let previewActive = false;
-const previewedEpochs = new Map<string, number>();
+let previewOnPractice = false; // session preview: ghosts drive on the practice canvas, view never changes
+let previewedAt = -1; // min-epoch last previewed (synced previews: all teams watch together)
 const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 
 // One module worker per team, created lazily. Null when workers are unavailable
@@ -1243,18 +1350,6 @@ function refreshTeamBest(st: TeamTrain) {
   st.pop = b.pop;
 }
 
-// Seed (or reseed) every island from one genome: champion copy + mutants.
-function reseedTeamIslands(st: TeamTrain, g: Float32Array, cfg: GAConfig) {
-  st.islands = st.islands.map(() => ({
-    pop: [g.slice(), ...Array.from({ length: Math.max(0, cfg.popSize - 1) }, () => mutateGenome(g, cfg.sigma, Math.random))],
-    best: g.slice(), bestFit: -Infinity, sigma: null, stasis: 0,
-    seed: (Math.random() * 2 ** 31) | 0, epoch: 0, lastAvg: NaN,
-  }));
-  st.best = g.slice(); st.bestFit = -Infinity; st.lastAvg = NaN;
-  st.histBest = []; st.histAvg = []; st.hof = null; st.migAt = 0;
-  st.sigma = null; st.stasis = 0; st.epoch = 0;
-  refreshTeamBest(st);
-}
 
 async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
   const team = teams.find((t) => t.id === st.teamId);
@@ -1262,9 +1357,10 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
   const net = practiceNet; // narrowed copy for closures below
   const phys = physicsFor(team);
   const cfg = practiceCfg();
-  if (isl.sigma == null) isl.sigma = cfg.sigma; // first epoch: take the UI rate, then adapt
+  if (st.finalize) { isl.sigma = 0.01; isl.stasis = 0; } // consolidate: frozen sigma, no restarts below
+  else if (isl.sigma == null) isl.sigma = cfg.sigma; // first epoch: take the UI rate, then adapt
   const hof = st.hof;
-  if (hof && isl.stasis >= 10) {
+  if (!st.finalize && hof && isl.stasis >= 10) {
     // champion + near mutants + fresh random immigrants: the immigrants bring
     // desaturated priors (throttle!) that crossover can combine with learned skills
     const near = restartPop(hof.genome, Math.max(2, Math.ceil(cfg.popSize / 2)), cfg.sigma, Math.random);
@@ -1277,7 +1373,9 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
     isl.stasis = 0; isl.sigma = cfg.sigma;
     say(`${team.name} island ${islIdx + 1}: no progress for 10 epochs — restarting around its hall of fame.`);
   }
-  const ecfg = { ...cfg, sigma: isl.sigma, timeout: epochTimeout(practiceIdx.total, cfg.laps) };
+  const ecfg = st.finalize
+    ? { ...cfg, sigma: 0.01, episodes: Math.max(4, cfg.episodes), crossoverRate: 0, robust: true, timeout: epochTimeout(practiceIdx.total, cfg.laps) }
+    : { ...cfg, sigma: isl.sigma, timeout: epochTimeout(practiceIdx.total, cfg.laps) };
   while (isl.pop.length < ecfg.popSize && isl.best) isl.pop.push(mutateGenome(isl.best, isl.sigma, Math.random));
   if (isl.pop.length > ecfg.popSize) isl.pop.length = ecfg.popSize;
   updatePracticeCards();
@@ -1302,12 +1400,11 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
   if (r.partial) { updatePracticeCards(); return; }
   isl.epoch++;
   isl.lastAvg = r.avgFitness;
-  st.histBest.push(r.bestFitness);
-  st.histAvg.push(r.avgFitness);
   st.lastAvg = r.avgFitness;
   if (!isl.best || r.bestFitness > isl.bestFit) {
-    // second opinion: re-score the candidate on fresh spawns and crown the mean,
-    // so lucky-spawn one-offs can't freeze as champions.
+    // second opinion: re-score the candidate on fresh spawns and crown the mean —
+    // but only when the mean beats the reigning champion, so a lucky single eval
+    // can't dethrone a confirmed best.
     let confirmFit = r.bestFitness;
     try {
       const cseed = (isl.seed = (isl.seed + 1) >>> 0);
@@ -1318,12 +1415,17 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
       if (!practiceTeams.some((s) => s.teamId === st.teamId)) return;
       if (!rc.partial) confirmFit = (r.bestFitness + rc.bestFitness) / 2;
     } catch { /* confirm failed: fall back to single eval */ }
-    isl.best = r.best; isl.bestFit = confirmFit; isl.stasis = 0;
-    isl.sigma = adaptSigma(isl.sigma ?? cfg.sigma, cfg.sigma, true, 0);
-    if (!st.hof || confirmFit > st.hof.fitness) st.hof = { genome: r.best.slice(), fitness: confirmFit, epoch: isl.epoch };
+    if (!isl.best || confirmFit > isl.bestFit) {
+      isl.best = r.best; isl.bestFit = confirmFit; isl.stasis = 0;
+      if (!st.finalize) isl.sigma = adaptSigma(isl.sigma ?? cfg.sigma, cfg.sigma, true, 0);
+      if (!st.hof || confirmFit > st.hof.fitness) st.hof = { genome: r.best.slice(), fitness: confirmFit, epoch: isl.epoch };
+    } else {
+      isl.stasis++;
+      if (!st.finalize) isl.sigma = adaptSigma(isl.sigma ?? cfg.sigma, cfg.sigma, false, isl.stasis);
+    }
   } else {
     isl.stasis++;
-    isl.sigma = adaptSigma(isl.sigma ?? cfg.sigma, cfg.sigma, false, isl.stasis);
+    if (!st.finalize) isl.sigma = adaptSigma(isl.sigma ?? cfg.sigma, cfg.sigma, false, isl.stasis);
   }
   refreshTeamBest(st);
   const sb = st.best; // crowned above when any island completed; guard for tsc
@@ -1331,36 +1433,11 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
     await saveWeights(st.teamId, encodeWeightsFile(st.teamId, team.name, sb));
     await savePopulation(st.teamId, st.pop.map((g) => [...g]));
   }
-  if (st.best && !seedDonors.some((d) => d.id === st.teamId)) {
-    seedDonors.push({ id: st.teamId, name: team.name, weights: st.best.slice() }); // new donor: weightless teams can seed from it
-    buildPracticeCards();
-  }
-  const X = raceCfg?.previewEvery ?? 0;
-  if (X > 0 && st.epoch > 0 && st.epoch % X === 0 && (previewedEpochs.get(st.teamId) ?? -1) !== st.epoch) {
-    previewedEpochs.set(st.teamId, st.epoch);
-    previewHold = true;
-  }
   updatePracticeCards();
   updateQualiGate();
 }
 
 // Manual preview: park training, show all current bests together, resume.
-async function requestManualPreview() {
-  if (previewRunning) return;
-  if (!practiceTeams.some((s) => s.best)) { say('Nothing to preview yet.'); return; }
-  previewHold = true;
-  stopAllWorkers(); // in-flight worker epochs abort at the next genome boundary
-  updatePracticeCards();
-  const t0 = Date.now();
-  while (inFlight.size > 0 && Date.now() - t0 < 30000) await sleep(150);
-  if (schedActive) {
-    // scheduler picks up the hold and runs the cycle; wait for it to clear
-    while (previewHold && !previewRunning && Date.now() - t0 < 180000) await sleep(200);
-    if (previewHold && !previewRunning) previewHold = false; // scheduler went away: release
-  } else {
-    await runPreviewCycle();
-  }
-}
 
 interface GhostCar { car: CarState; genome: Float32Array; color: string; secondary: string; hint: number; prevFrac: number | null; prog: number; done: boolean; frames: number; phys: PhysicsParams }
 let previewCars: GhostCar[] = [];
@@ -1375,24 +1452,40 @@ async function runPreviewCycle() {
   previewAbort = false;
   try {
     previewIdx = practiceIdx;
-    previewCars = ready.map((s) => {
+    // Representative sample: every island's champion on track at once (capped).
+    previewCars = [];
+    for (const s of ready) {
       const team = teams.find((t) => t.id === s.teamId)!;
-      const { car } = spawn(previewIdx!);
-      return { car, genome: s.best!.slice(), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, done: false, frames: 0, phys: physicsFor(team) };
-    });
-    showView('tracks');
-    (document.querySelector('#panel') as HTMLElement).style.visibility = 'hidden'; // full-width track, no layout shift
-    say(`Previewing bests — ${previewCars.length} car${previewCars.length === 1 ? '' : 's'} on track.`);
+      for (const isl of s.islands) {
+        if (!isl.best) continue;
+        const { car } = spawn(previewIdx!);
+        previewCars.push({ car, genome: isl.best.slice(), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, done: false, frames: 0, phys: physicsFor(team) });
+        if (previewCars.length >= 12) break;
+      }
+      if (previewCars.length >= 12) break;
+    }
+    previewOnPractice = session != null && racePane === 'practice';
+    if (!previewOnPractice) {
+      showView('tracks');
+      (document.querySelector('#panel') as HTMLElement).style.visibility = 'hidden'; // full-width track, no layout shift
+    }
+    say(`Previewing ${previewCars.length} cars — every island's champion on track.`);
     await animateGhostLap();
   } finally {
+    const onPractice = previewOnPractice;
     previewRunning = false;
     previewActive = false;
     previewHold = false;
     previewCars = [];
     previewIdx = null;
-    (document.querySelector('#panel') as HTMLElement).style.visibility = '';
-    if (!previewAbort) { showView('races'); setRacePane('practice'); }
-    render();
+    previewOnPractice = false;
+    if (onPractice) {
+      if (!previewAbort) drawPracticeScene(); // clear the ghosts, back to the static track
+    } else {
+      (document.querySelector('#panel') as HTMLElement).style.visibility = '';
+      if (!previewAbort) { showView('races'); setRacePane('practice'); }
+      render();
+    }
   }
 }
 
@@ -1415,7 +1508,7 @@ function animateGhostLap(): Promise<void> {
         if (loc.dist > loc.hw || g.prog >= 1 || ++g.frames > 60 * 75) { g.done = true; continue; }
         stepCar(g.car, forwardGenome(g.genome, observe(previewIdx, g.car, loc)), g.phys);
       }
-      render();
+      if (previewOnPractice) drawPracticePreview(); else render();
       if (allDone) { setTimeout(resolve, 800); return; }
       requestAnimationFrame(step);
     };
@@ -1440,6 +1533,9 @@ function refitSessions() {
   if (!gid('race-race').hidden && raceIdx) {
     if (fitSessionCanvas(gid('race-canvas') as HTMLCanvasElement) && !raceRunning) drawRaceSceneOnCanvas();
   }
+  if (!gid('race-practice').hidden && practiceIdx && session && !previewRunning) {
+    if (fitSessionCanvas(gid('practice-canvas') as HTMLCanvasElement)) drawPracticeScene();
+  }
 }
 
 function liveryFor(primary: string, secondary: string): HTMLCanvasElement {
@@ -1453,7 +1549,12 @@ function liveryFor(primary: string, secondary: string): HTMLCanvasElement {
   }
   return cv;
 }
-function drawSessionCars(ctx: CanvasRenderingContext2D, cars: { x: number; y: number; heading: number; primary: string; secondary: string; dim?: boolean }[], size = 34) {
+// Real F1 proportions: 5.6m long on a ~12m wide track ≈ 0.5× width; 0.75× keeps
+// liveries readable at game zoom. A 34px car on 23px Monaco was wider than the road.
+function carSizeFor(trackWidth: number): number {
+  return Math.min(28, Math.max(16, Math.round(trackWidth * 0.75)));
+}
+function drawSessionCars(ctx: CanvasRenderingContext2D, cars: { x: number; y: number; heading: number; primary: string; secondary: string; dim?: boolean }[], size = 24) {
   for (const c of cars) {
     const img = liveryFor(c.primary, c.secondary);
     const W = (size * img.width) / img.height;
@@ -1481,44 +1582,16 @@ function renderPreviewScene() {
   pathOf(right, true); ctx.stroke();
   ctx.fillStyle = '#3d3d3d';
   pathOf(ribbon(idx.track), true); ctx.fill();
-  drawSessionCars(ctx, previewCars.map((g) => ({ x: g.car.x, y: g.car.y, heading: g.car.heading, primary: g.color, secondary: g.secondary, dim: g.done })));
+  drawSessionCars(ctx, previewCars.map((g) => ({ x: g.car.x, y: g.car.y, heading: g.car.heading, primary: g.color, secondary: g.secondary, dim: g.done })), carSizeFor(idx.track.width));
 }
 
-function exportTeamWeights(teamId: string) {
-  const st = practiceTeams.find((s) => s.teamId === teamId);
-  const team = teams.find((t) => t.id === teamId);
-  if (!st?.best || !team) { say('Nothing to export'); return; }
-  const blob = new Blob([JSON.stringify(encodeWeightsFile(teamId, team.name, st.best), null, 2)], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = `weights-${team.name}.json`; a.click();
-  URL.revokeObjectURL(a.href);
-}
-
-(gid('file-weights') as HTMLInputElement).onchange = async (e) => {
-  const f = (e.target as HTMLInputElement).files?.[0];
-  (e.target as HTMLInputElement).value = '';
-  if (!f || !weightsImportTarget || !practiceNet) return;
-  const st = practiceTeams.find((s) => s.teamId === weightsImportTarget);
-  weightsImportTarget = null;
-  if (!st) return;
-  try {
-    const wf = decodeWeightsFile(JSON.parse(await f.text()), practiceNet.size);
-    if (!wf) { say('Import failed: bad weights file.'); return; }
-    const cfg = practiceCfg();
-    reseedTeamIslands(st, new Float32Array(wf.weights), cfg);
-    st.status = 'stopped';
-    await saveWeights(st.teamId, wf);
-    await savePopulation(st.teamId, st.pop.map((g) => [...g]));
-    updatePracticeCards(); updateQualiGate();
-    say(`Weights imported for ${teams.find((t) => t.id === st.teamId)?.name ?? 'team'}.`);
-  } catch { say('Import failed: invalid weights JSON'); }
-};
 
 function updateQualiGate() {
   const btn = gid('btn-start-quali') as HTMLButtonElement;
-  const ready = raceCfg != null && raceCfg.teamIds.length > 0 && raceCfg.teamIds.every((id) => practiceTeams.some((s) => s.teamId === id && s.best));
+  const trained = raceCfg != null && raceCfg.teamIds.length > 0 && raceCfg.teamIds.every((id) => practiceTeams.some((s) => s.teamId === id && s.best));
+  const ready = trained && (!session || session.done);
   btn.disabled = !ready;
-  gid('practice-hint').textContent = ready ? '' : 'Every team needs weights (train or import) to unlock qualifying.';
+  gid('practice-hint').textContent = ready || (session && !session.done) ? '' : 'Every team needs weights (train or import) to unlock qualifying.';
 }
 // ---- qualifying session (Story 4, subtask 7) ----
 interface QualiRun { roster: Driver[]; entries: QualiEntry[]; idx: number; seed: number; aborted: boolean; running: boolean }
@@ -1549,13 +1622,14 @@ async function enterQuali() {
     && saved.cfg.teamIds.join() === raceCfg.teamIds.join() && saved.cfg.drivers === raceCfg.drivers && saved.cfg.laps === raceCfg.laps;
   const seed = sameCfg ? saved.seed : (Math.random() * 2 ** 31) | 0;
   const roster = buildRoster(raceCfg.teamIds, names, raceCfg.drivers, pops, bests, mulberry32(seed));
-  quali = { roster, entries: sameCfg ? saved.quali.map((e) => ({ ...e, teamName: names.get(e.teamId) ?? e.teamId })) : [], idx: sameCfg ? saved.nextIdx : 0, seed, aborted: false, running: false };
+  quali = { roster, entries: sameCfg ? saved.quali.map((e) => ({ ...e, teamName: names.get(e.teamId) ?? e.teamId })) : [], idx: 0, seed, aborted: false, running: false };
+  quali.idx = quali.entries.length; // completed count (finish order, not roster order)
   (gid('btn-start-race') as HTMLButtonElement).disabled = true;
   setRacePane('quali');
   drawQualiScene([]); // immediate first paint so the canvas never sits blank
-  renderQualiBoard(-1);
+  renderQualiBoard();
   void renderLastResults();
-  if (sameCfg && quali.idx > 0) say(`Qualifying resumed at driver ${quali.idx + 1}.`);
+  if (sameCfg && quali.idx > 0) say(`Qualifying resumed with ${quali.idx} placed drivers.`);
   void qualiLoop();
 }
 
@@ -1569,55 +1643,79 @@ function qualiTimeout(): number {
   return (4 * qualiIdx.total) / (0.5 * vMax); // generous: early AI crawls
 }
 
+// Simultaneous qualifying: the whole grid launches together from staggered slots
+// and each driver's flying lap (line-to-line) is timed. Finished drivers keep
+// their entries; reloads re-run only the unfinished.
+interface QualiRunner {
+  d: Driver; car: CarState; genome: Float32Array; phys: PhysicsParams;
+  color: string; secondary: string;
+  hint: number; prevFrac: number | null; prog: number; time: number; frames: number;
+  tZero: number | null; done: boolean;
+}
+let qualiLive: QualiRunner[] = [];
+
 async function qualiLoop() {
   if (!quali || !qualiIdx || !practiceNet || quali.running) return;
   quali.running = true;
   const timeout = qualiTimeout();
-  while (quali && !quali.aborted && quali.idx < quali.roster.length) {
-    const d = quali.roster[quali.idx];
-    renderQualiBoard(quali.idx);
-    const res = await animateQualiLap(d, timeout);
-    if (!quali || quali.aborted) break;
-    quali.entries.push({ teamId: d.teamId, teamName: d.teamName, name: d.name, time: res.done === 'lap' ? res.time : null, progress: res.progress });
-    quali.idx++;
-    await saveRaceSession({ stage: 'quali', cfg: raceCfg!, seed: quali.seed, quali: quali.entries, nextIdx: quali.idx });
-    renderQualiBoard(-1);
+  try {
+    const doneKeys = new Set(quali.entries.map((e) => e.teamId + '|' + e.name));
+    const lineup = quali.roster.filter((d) => !doneKeys.has(d.teamId + '|' + d.name));
+    qualiLive = lineup.map((d) => {
+      const team = teams.find((t) => t.id === d.teamId)!;
+      return { d, car: { x: 0, y: 0, heading: 0, vx: 0, vy: 0 }, genome: new Float32Array(d.genome), phys: physicsFor(team), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, time: 0, frames: 0, tZero: null, done: false };
+    });
+    if (qualiLive.length) {
+      const slots = gridSlots(qualiIdx, qualiLive.length);
+      qualiLive.forEach((r, i) => { r.car = { x: slots[i].x, y: slots[i].y, heading: slots[i].heading, vx: 0, vy: 0 }; });
+      say(`Qualifying — ${qualiLive.length} driver${qualiLive.length === 1 ? '' : 's'} on track together.`);
+      await animateQualiAll(timeout);
+    }
+  } finally {
+    qualiLive = [];
+    if (quali) {
+      quali.idx = quali.entries.length;
+      if (!quali.aborted && quali.idx >= quali.roster.length) (gid('btn-start-race') as HTMLButtonElement).disabled = false;
+      quali.running = false;
+    }
+    renderQualiBoard();
   }
-  if (quali && !quali.aborted && quali.idx >= quali.roster.length) {
-    (gid('btn-start-race') as HTMLButtonElement).disabled = false;
-  }
-  if (quali) quali.running = false;
 }
 
-function animateQualiLap(d: Driver, timeout: number): Promise<{ time: number; progress: number; done: string }> {
+function animateQualiAll(timeout: number): Promise<void> {
   return new Promise((resolve) => {
     const idx = qualiIdx!;
-    const team = teams.find((t) => t.id === d.teamId)!;
-    const phys = physicsFor(team);
-    const genome = new Float32Array(d.genome);
-    const { car } = spawn(idx);
-    let hint = -1, prevFrac: number | null = null, prog = 0, time = 0, frames = 0;
-    const color = team.primary;
+    const finish = (r: QualiRunner, time: number | null) => {
+      r.done = true;
+      if (!quali) return;
+      quali.entries.push({ teamId: r.d.teamId, teamName: r.d.teamName, name: r.d.name, time, progress: r.prog });
+      quali.idx = quali.entries.length;
+      saveRaceSession({ stage: 'quali', cfg: raceCfg!, seed: quali.seed, quali: quali.entries, nextIdx: quali.idx }).catch(() => {});
+    };
     const step = () => {
-      if (!quali || quali.aborted) return resolve({ time, progress: prog, done: 'abort' });
+      if (!quali || quali.aborted || !practiceNet) return resolve();
       try {
-      const loc = locate(idx, car.x, car.y, hint);
-      hint = loc.bi;
-      if (prevFrac == null) prevFrac = loc.frac;
-      let df = loc.frac - prevFrac;
-      if (df > 0.5) df -= 1;
-      else if (df < -0.5) df += 1;
-      prog += df;
-      prevFrac = loc.frac;
-      if (loc.dist > loc.hw) return resolve({ time, progress: prog, done: 'crash' });
-      if (prog >= 1) return resolve({ time, progress: prog, done: 'lap' });
-      if (time >= timeout || ++frames > 60 * 120) return resolve({ time, progress: prog, done: 'timeout' });
-      stepCar(car, forwardGenome(genome, observe(idx, car, loc)), phys);
-      time += DT;
-      drawQualiScene([{ x: car.x, y: car.y, heading: car.heading, color, secondary: team.secondary }]);
-      renderQualiBoardLive(time, prog);
-      requestAnimationFrame(step);
-      } catch { resolve({ time, progress: prog, done: 'timeout' }); }
+        let allDone = true;
+        for (const r of qualiLive) {
+          if (r.done) continue;
+          allDone = false;
+          const loc = locate(idx, r.car.x, r.car.y, r.hint);
+          r.hint = loc.bi;
+          if (r.prevFrac == null) r.prevFrac = loc.frac;
+          let df = loc.frac - r.prevFrac;
+          if (df > 0.5) df -= 1; else if (df < -0.5) df += 1;
+          r.prog += df; r.prevFrac = loc.frac;
+          if (r.tZero == null && r.prog >= 0) r.tZero = r.time;
+          if (loc.dist > loc.hw) finish(r, null);
+          else if (r.prog >= 1) finish(r, r.time - (r.tZero ?? 0));
+          else if (r.time >= timeout || ++r.frames > 60 * 120) finish(r, null);
+          else { stepCar(r.car, forwardGenome(r.genome, observe(idx, r.car, loc)), r.phys); r.time += DT; }
+        }
+        drawQualiScene(qualiLive.map((r) => ({ x: r.car.x, y: r.car.y, heading: r.car.heading, color: r.color, secondary: r.secondary, dim: r.done })));
+        renderQualiBoard();
+        if (allDone) { setTimeout(resolve, 800); return; }
+        requestAnimationFrame(step);
+      } catch { resolve(); }
     };
     requestAnimationFrame(step);
   });
@@ -1627,8 +1725,8 @@ function drawQualiScene(cars: (SceneCar & { secondary: string })[]) {
   const cv = gid('quali-canvas') as HTMLCanvasElement;
   const idx = qualiIdx!;
   const ctx = cv.getContext('2d')!;
-  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track));
-  drawSessionCars(ctx, cars.map((c) => ({ x: c.x, y: c.y, heading: c.heading, primary: c.color, secondary: c.secondary, dim: c.dim })));
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (qualiIdx && !quali?.running) drawQualiScene([]); }));
+  drawSessionCars(ctx, cars.map((c) => ({ x: c.x, y: c.y, heading: c.heading, primary: c.color, secondary: c.secondary, dim: c.dim })), carSizeFor(idx.track.width));
 }
 
 function fmtTime(t: number) {
@@ -1653,7 +1751,7 @@ function boardRow(ul: HTMLElement, o: { pos: string; mi: number; color: string; 
   ul.appendChild(li);
 }
 
-function renderQualiBoard(liveIdx: number) {
+function renderQualiBoard() {
   const ul = gid('quali-board');
   ul.innerHTML = '';
   const ranked = sortQuali(quali?.entries ?? []);
@@ -1667,19 +1765,17 @@ function renderQualiBoard(liveIdx: number) {
       metaBad: !done,
     });
   });
-  if (quali && liveIdx >= 0 && liveIdx < quali.roster.length) {
-    const d = quali.roster[liveIdx];
-    const team = teams.find((t) => t.id === d.teamId);
-    boardRow(ul, { pos: '…', mi: -1, color: team?.primary ?? '#888', team: d.teamName, name: d.name, meta: '0.00s', live: true, liveId: 'quali-live-time' });
-  }
+  // everyone still driving, quickest first
+  qualiLive.filter((r) => !r.done).sort((a, b) => b.prog - a.prog).forEach((r) => {
+    boardRow(ul, {
+      pos: '…', mi: -1, color: r.color, team: r.d.teamName, name: r.d.name,
+      meta: `${fmtTime(r.time - (r.tZero ?? 0))} · ${(Math.max(0, r.prog) * 100).toFixed(0)}%`, live: true,
+    });
+  });
   const qdone = quali?.entries.length ?? 0, qtotal = quali?.roster.length ?? 0;
   gid('btn-start-race').textContent = qtotal && qdone >= qtotal ? 'Start race' : `Start race (${qdone}/${qtotal})`;
 }
 
-function renderQualiBoardLive(time: number, prog: number) {
-  const el = gid('quali-live-time');
-  if (el) el.textContent = `${fmtTime(time)} · ${(Math.max(0, prog) * 100).toFixed(0)}%`;
-}
 
 async function renderLastResults() {
   const el = gid('race-last-results');
@@ -1702,6 +1798,7 @@ interface RaceCar {
   color: string; hint: number; prevFrac: number | null; prog: number;
   time: number;
   done: boolean; dnf: boolean; finishTime: number | null;
+  gateKeys: string[]; gateMap: Map<string, number>; nextGate: number | null; // gate-crossing times for gap timing (key = lap:gate, -1 = start line)
 }
 let raceCars: RaceCar[] = [];
 let raceIdx: TrackIndex | null = null;
@@ -1751,16 +1848,37 @@ async function enterRace() {
       teamId: e.teamId, teamName: e.teamName, name: e.name, phys: physicsFor(team),
       car: { x: slots[i].x, y: slots[i].y, heading: slots[i].heading, vx: 0, vy: 0 },
       genome: new Float32Array(qd.genome), color: team.primary,
-      hint: -1, prevFrac: null, prog: 0, time: 0,
+      hint: -1, prevFrac: null, prog: 0, time: 0, gateKeys: [], gateMap: new Map(), nextGate: null,
       done: false, dnf: false, finishTime: null,
     };
   });
   } catch { say('Could not build the starting grid.'); return; }
-  raceRunning = true;
   raceAbort = false;
   setRacePane('race');
+  drawRaceSceneOnCanvas();
   renderRaceBoard();
+  void runStartLights();
+}
+
+// F1 start: 5 lamps at 0.6s intervals, random 0.4–1.8s hold, then lights out.
+// Cars sit on the grid until the lamps go — raceStep only runs after.
+async function runStartLights() {
+  const el = gid('race-lights');
+  el.hidden = false;
+  const lamps = [...el.querySelectorAll('.light')];
+  lamps.forEach((l) => l.classList.remove('on'));
+  for (const lamp of lamps) {
+    await sleep(600);
+    if (raceAbort || !raceIdx) { el.hidden = true; return; }
+    lamp.classList.add('on');
+  }
+  await sleep(400 + Math.random() * 1400);
+  if (raceAbort || !raceIdx) { el.hidden = true; return; }
+  lamps.forEach((l) => l.classList.remove('on'));
+  say('LIGHTS OUT!');
+  raceRunning = true;
   requestAnimationFrame(raceStep);
+  window.setTimeout(() => { el.hidden = true; }, 1200);
 }
 
 function raceStep() {
@@ -1777,6 +1895,26 @@ function raceStep() {
     if (df > 0.5) df -= 1;
     else if (df < -0.5) df += 1;
     r.prog += df;
+    // gate + lap crossings for gap timing (r.prevFrac still holds last frame's frac)
+    const lapNow = Math.floor(r.prog);
+    if (Math.floor(r.prog - df) < lapNow) {
+      const k = `${lapNow}:-1`;
+      if (!r.gateMap.has(k)) { r.gateMap.set(k, r.time); r.gateKeys.push(k); }
+    }
+    const gates = raceIdx.gateOrder;
+    if (gates.length) {
+      if (r.nextGate == null) {
+        const ni = gates.findIndex((g) => g.fr > loc.frac);
+        r.nextGate = ni < 0 ? 0 : ni;
+      }
+      const between = (a: number, b: number, x: number) => a <= b ? (x > a && x <= b) : (x > a || x <= b);
+      let guard = 0;
+      while (guard++ < 2 && r.nextGate != null && between(r.prevFrac ?? loc.frac, loc.frac, gates[r.nextGate].fr)) {
+        const k = `${lapNow}:${r.nextGate}`;
+        if (!r.gateMap.has(k)) { r.gateMap.set(k, r.time); r.gateKeys.push(k); }
+        r.nextGate = (r.nextGate + 1) % gates.length;
+      }
+    }
     r.prevFrac = loc.frac;
     if (loc.dist > loc.hw) { r.done = true; r.dnf = true; continue; }
     if (r.prog >= raceLaps) { r.done = true; r.finishTime = r.time; continue; }
@@ -1794,29 +1932,44 @@ function drawRaceSceneOnCanvas() {
   const cv = gid('race-canvas') as HTMLCanvasElement;
   const idx = raceIdx!;
   const ctx = cv.getContext('2d')!;
-  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track));
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (raceIdx && !raceRunning) drawRaceSceneOnCanvas(); }));
   drawSessionCars(ctx, raceCars.map((r) => {
     const team = teams.find((t) => t.id === r.teamId);
     return { x: r.car.x, y: r.car.y, heading: r.car.heading, primary: r.color, secondary: team?.secondary ?? '#ffffff', dim: r.done };
-  }));
+  }), carSizeFor(idx.track.width));
 }
 
 function raceOrder(): RaceCar[] {
   return raceCars.slice().sort((a, b) => b.prog - a.prog);
 }
 
+// Gap to the car ahead in seconds, measured at the latest gate (or start line)
+// both have crossed: same piece of tarmac, two timestamps. Null when they share
+// no crossing yet (opening corners).
+function gapToAhead(me: RaceCar, ahead: RaceCar): string | null {
+  for (let i = me.gateKeys.length - 1; i >= 0; i--) {
+    const t = ahead.gateMap.get(me.gateKeys[i]);
+    if (t != null) return `+${(me.gateMap.get(me.gateKeys[i])! - t).toFixed(2)}`;
+  }
+  return null;
+}
+
 function renderRaceBoard() {
   const ul = gid('race-board');
   ul.innerHTML = '';
-  raceOrder().forEach((r, i) => {
+  const ordered = raceOrder();
+  const winner = ordered.filter((r) => r.finishTime != null).sort((a, b) => a.finishTime! - b.finishTime!)[0];
+  ordered.forEach((r, i) => {
     const team = teams.find((t) => t.id === r.teamId);
-    const lap = Math.min(raceLaps, Math.floor(Math.max(0, r.prog)) + 1);
-    const finished = r.finishTime != null;
-    const bad = r.dnf && !finished;
+    let meta: string; let bad = false;
+    if (r.finishTime != null) {
+      meta = winner && winner !== r && winner.finishTime != null ? `+${(r.finishTime - winner.finishTime).toFixed(2)}` : 'Winner';
+    } else if (r.dnf) { meta = 'DNF'; bad = true; }
+    else if (i === 0) { meta = 'Leader'; }
+    else { meta = gapToAhead(r, ordered[i - 1]) ?? '—'; }
     boardRow(ul, {
       pos: `P${i + 1}`, mi: i, color: team?.primary ?? '#888', team: r.teamName, name: r.name,
-      meta: finished ? fmtTime(r.finishTime!) : bad ? `DNF · L${lap}` : `L${lap} · ${(Math.max(0, r.prog) * 100 / raceLaps).toFixed(0)}%`,
-      metaBad: bad, dim: r.done,
+      meta, metaBad: bad, dim: r.done,
     });
   });
   const lead = raceOrder().find((r) => !r.done) ?? raceOrder()[0];
@@ -1835,9 +1988,8 @@ async function finishRace() {
 }
 
 gid('btn-start-race').onclick = () => { void enterRace(); };
-gid('btn-race-back').onclick = () => { raceAbort = true; raceRunning = false; setRacePane('quali'); };
-gid('btn-preview-now').onclick = () => void requestManualPreview();
-gid('btn-practice-back').onclick = () => { stopPracticeAll(); setRacePane('setup'); void renderRaces(); };
+gid('btn-race-back').onclick = () => { raceAbort = true; raceRunning = false; gid('race-lights').hidden = true; setRacePane('quali'); };
+gid('btn-practice-back').onclick = () => { session = null; stopPracticeAll(); stopAllWorkers(); setRacePane('setup'); void renderRaces(); };
 (gid('in-ga-preview') as HTMLInputElement).onchange = async () => {
   if (!raceCfg) return;
   const v = Math.max(0, Math.round(Number((gid('in-ga-preview') as HTMLInputElement).value) || 0));
@@ -1857,9 +2009,28 @@ gid('btn-race-begin').onclick = async () => {
   const errs = validateSetup(input, tracks, teams);
   if (errs.length) { gid('race-setup-hint').textContent = errs[0]; say(errs[0]); return; }
   gid('race-setup-hint').textContent = '';
-  raceCfg = { ...input, previewEvery: raceCfg?.previewEvery ?? 0 };
+  raceCfg = { ...input, previewEvery: Math.max(0, Math.round(Number((gid('in-ga-preview') as HTMLInputElement).value) || 0)) };
   await saveRaceCfg(raceCfg);
   if (await enterPractice()) setRacePane('practice');
+};
+gid('btn-race-skip').onclick = async () => {
+  const tracks = await listTracks();
+  const teamIds = [...gid('race-teams').querySelectorAll<HTMLInputElement>('input:checked')].map((cb) => cb.value);
+  const input = {
+    trackId: (gid('sel-race-track') as HTMLSelectElement).value,
+    teamIds,
+    drivers: Number((gid('in-race-drivers') as HTMLInputElement).value),
+    laps: Number((gid('in-race-laps') as HTMLInputElement).value),
+  };
+  const errs = validateSetup(input, tracks, teams);
+  if (errs.length) { gid('race-setup-hint').textContent = errs[0]; say(errs[0]); return; }
+  for (const id of teamIds) {
+    if (!await loadWeights(id)) { say('A selected team has no saved weights — train first.'); return; }
+  }
+  gid('race-setup-hint').textContent = '';
+  raceCfg = { ...input, previewEvery: 0 };
+  await saveRaceCfg(raceCfg);
+  void enterQuali();
 };
 gid('btn-race-single').onclick = () => { setRacePane('setup'); void renderRaces(); };
 gid('btn-race-champ').onclick = () => setRacePane('champ');

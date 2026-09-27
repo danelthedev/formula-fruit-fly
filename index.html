@@ -45,6 +45,10 @@
             <button id="btn-start">Set start</button>
             <button id="btn-tool-gate">Checkpoint</button>
           </div>
+          <div class="row">
+            <span class="hint">Direction: <strong id="track-direction">—</strong></span>
+            <button id="btn-reverse" title="Flip the racing direction (start line and checkpoints ride along)">Reverse direction</button>
+          </div>
           <div id="gate-editor" hidden>
             <h2 id="gate-title">Checkpoint</h2>
             <label>Gate width <input id="in-gate-width" type="range" min="20" max="160" value="60" /> <span id="gate-width-val">60</span></label>
@@ -141,28 +145,37 @@
         <label>Drivers per team <input id="in-race-drivers" type="number" min="1" max="4" value="2" /></label>
         <label>Laps <input id="in-race-laps" type="number" min="1" max="10" value="3" /></label>
         <div class="row">
-          <button id="btn-race-begin">Begin practice</button>
-          <button id="btn-race-setup-back">Back</button>
-        </div>
-        <p class="hint" id="race-setup-hint"></p>
-      </div>
-      <div id="race-practice" hidden>
-        <h2>Practice</h2>
-        <p id="race-practice-summary"></p>
-        <div class="row">
           <label>Population <input id="in-ga-pop" type="number" min="4" max="256" value="32" /></label>
           <label>Islands <input id="in-ga-islands" type="number" min="1" max="4" value="3" title="Parallel populations per team; champions migrate between islands" /></label>
           <label>Mutation σ <input id="in-ga-sigma" type="number" min="0.005" max="0.5" step="0.005" value="0.05" /></label>
-          <label>Preview every <input id="in-ga-preview" type="number" min="0" max="50" value="0" /> epochs</label>
         </div>
-        <div id="practice-teams"></div>
         <div class="row">
-          <button id="btn-start-quali" disabled>Start Qualifying</button>
-          <button id="btn-preview-now">Current Epoch Preview</button>
-          <button id="btn-practice-back">Back to setup</button>
+          <label>Explore epochs <input id="in-ga-explore" type="number" min="10" max="500" value="90" title="Evolve freely, then auto-switch to finalize" /></label>
+          <label>Finalize epochs <input id="in-ga-finalize" type="number" min="0" max="200" value="40" title="Consolidate around champions: frozen mutation, worst-episode selection" /></label>
+          <label>Preview every <input id="in-ga-preview" type="number" min="0" max="50" value="10" title="Watch a sample of cars drive every N epochs (0 = off)" /> epochs</label>
+        </div>
+        <div class="row">
+          <button id="btn-race-begin">Begin practice</button>
+          <button id="btn-race-skip" title="Qualify straight from saved weights, no training. Weights are per-team, not per-track.">Skip to qualifying</button>
+          <button id="btn-race-setup-back">Back</button>
+        </div>
+        <p class="hint" id="race-setup-hint"></p>
+        <input id="file-weights" type="file" accept="application/json" hidden />
+      </div>
+      <div id="race-practice" hidden>
+        <h2 id="practice-title">Practice</h2>
+        <div class="session-wrap">
+          <canvas id="practice-canvas"></canvas>
+          <aside class="session-side">
+            <h3>Leaderboard</h3>
+            <ul id="practice-board" class="board"></ul>
+            <div class="row">
+              <button id="btn-start-quali" disabled>Start Qualifying</button>
+              <button id="btn-practice-back">Back to setup</button>
+            </div>
+          </aside>
         </div>
         <p class="hint" id="practice-hint"></p>
-        <input id="file-weights" type="file" accept="application/json" hidden />
       </div>
       <div id="race-quali" hidden>
         <h2>Qualifying</h2>
@@ -190,6 +203,9 @@
               <button id="btn-race-back">Back to qualifying</button>
             </div>
           </aside>
+        </div>
+        <div id="race-lights" hidden>
+          <span class="light"></span><span class="light"></span><span class="light"></span><span class="light"></span><span class="light"></span>
         </div>
       </div>
       <div id="race-champ" hidden>

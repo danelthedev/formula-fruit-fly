@@ -13,19 +13,28 @@ export interface Team {
 }
 
 // Central physics map (Stories 3-4 use physicsFor, never raw specs).
+// Scale: track widths (23-38px) stand in for real 7-14m widths → ~3px/m.
+// Rates below are the real F1 numbers at that scale: 0-100km/h (~83px) in
+// ~2s (traction-limited, engine ≈ vMax/3), braking ~5-6g ≈ 150-180px/s²,
+// cornering ~5g lateral. Top speed kept game-fast so laps stay ~15-30s.
+// Arcade concession: drawn kinks need ~7-12px radii (≈3m), far tighter than
+// any real corner, so crawl-speed lock stays superhuman — realism applies
+// at pace, via the latA yaw cap.
 export interface PhysicsParams {
   vMax: number;     // px/s top speed
   engine: number;   // px/s^2 engine force
   brake: number;    // px/s^2 brake force
-  steerMax: number; // rad max steer angle
-  grip: number;     // lateral grip 1/s
+  steerMax: number; // rad max steer angle (low-speed lock)
+  grip: number;     // lateral slide decay 1/s
+  latA: number;     // px/s^2 max lateral accel: yaw capped at latA/v
 }
 export const SPEC_MAP = {
   vMax: (t: number) => 100 + t * 20,
-  engine: (a: number) => 1000 + a * 350,
-  brake: (b: number) => 1500 + b * 500,
-  steerMax: (t: number) => 0.15 + t * 0.035,
-  grip: (t: number) => 2 + t * 0.8,
+  engine: (a: number) => 25 + a * 9, // 0-vMax τ ≈ 3s (was 0.07s: instant RC launch)
+  brake: (b: number) => 90 + b * 18, // ~200px/s→50 in ~100px: braking zones exist
+  steerMax: (t: number) => 0.22 + t * 0.05, // with WB=6: R_min ≈ current 21/12/7px per spec
+  grip: (t: number) => 1.2 + t * 0.35, // slide lasts ~0.3s: weight, not ice, not glue
+  latA: (t: number) => 90 + t * 12, // ≈5g at spec 5: yaw capped at latA/v above ~42px/s
 };
 export function physicsFor(t: Team): PhysicsParams {
   return {
@@ -34,6 +43,7 @@ export function physicsFor(t: Team): PhysicsParams {
     brake: SPEC_MAP.brake(t.brakeEfficiency),
     steerMax: SPEC_MAP.steerMax(t.turningAbility),
     grip: SPEC_MAP.grip(t.turningAbility),
+    latA: SPEC_MAP.latA(t.turningAbility),
   };
 }
 

@@ -79,16 +79,18 @@ export function withBrakeBias(g: Float32Array, amount: number): Float32Array {
 }
 
 // Weights file format (IDB + JSON export/import). Arch tag guards mismatches.
-export interface WeightsFile { v: 1; teamId: string; teamName: string; arch: number[]; weights: number[] }
+// v2 = real-rate physics generation (engine/brake/grip/latA retune): v1 genomes
+// assumed instant response and un-limited yaw, so they drive off the road now.
+export interface WeightsFile { v: 2; teamId: string; teamName: string; arch: number[]; weights: number[] }
 export function encodeWeightsFile(teamId: string, teamName: string, genome: Float32Array | number[]): WeightsFile {
-  return { v: 1, teamId, teamName, arch: NET_ARCH.slice(), weights: [...genome] };
+  return { v: 2, teamId, teamName, arch: NET_ARCH.slice(), weights: [...genome] };
 }
 export function decodeWeightsFile(o: unknown, genomeSize: number): WeightsFile | null {
   if (!o || typeof o !== 'object') return null;
   const r = o as Record<string, unknown>;
-  if (r.v !== 1 || typeof r.teamId !== 'string' || typeof r.teamName !== 'string') return null;
+  if (r.v !== 2 || typeof r.teamId !== 'string' || typeof r.teamName !== 'string') return null;
   if (!Array.isArray(r.arch) || r.arch.join(',') !== NET_ARCH.join(',')) return null;
   if (!Array.isArray(r.weights) || r.weights.length !== genomeSize) return null;
   if (!(r.weights as unknown[]).every((w) => typeof w === 'number' && Number.isFinite(w))) return null;
-  return { v: 1, teamId: r.teamId, teamName: r.teamName, arch: NET_ARCH.slice(), weights: (r.weights as number[]).slice() };
+  return { v: 2, teamId: r.teamId, teamName: r.teamName, arch: NET_ARCH.slice(), weights: (r.weights as number[]).slice() };
 }

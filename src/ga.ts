@@ -10,10 +10,13 @@ import type { PhysicsParams } from './teams.ts';
 export interface GAConfig {
   popSize: number; elite: number; sigma: number;
   episodes: number; timeout: number; laps: number;
+  crossoverRate: number; // 0.7 explore: uniform crossover; 0 finalize: pure mutation
+  robust: boolean; // false: select on mean over episodes; true: worst episode (robust lappers)
   spawnFocus?: number | null; // curriculum: non-start episodes spawn at this frac (±0.02 jitter) instead of sampled corners
 }
 export const DEFAULT_GA: GAConfig = {
   popSize: 32, elite: 4, sigma: 0.05, episodes: 2, timeout: 20, laps: 1,
+  crossoverRate: 0.7, robust: false,
 };
 
 export function fitnessOf(r: EpisodeResult): number {
@@ -65,12 +68,12 @@ export function migrateIslands(pops: Float32Array[][], bests: (Float32Array | nu
   }
 }
 
-// Timeout scaled to track length at learning pace (~50px/s): cautious genomes
-// need ~2x the time of fast ones; cutting them off makes the lap bonus
-// unreachable and removes all gradient toward finishing.
+// Timeout scaled to track length at learning pace (~35px/s with real accel
+// rates: the 0-vMax ramp takes ~3s now): cautious genomes need ~2x the time
+// of fast ones; cutting them off removes all gradient toward finishing.
 export function epochTimeout(totalPx: number, laps: number): number {
   if (!Number.isFinite(totalPx) || totalPx <= 0) return 40;
-  return Math.min(150, Math.max(40, (totalPx / 50) * Math.max(1, laps)));
+  return Math.min(150, Math.max(40, (totalPx / 35) * Math.max(1, laps)));
 }
 
 // Uniform crossover: per-weight pick from either parent (seeded). Pure.
@@ -91,7 +94,12 @@ export interface EpochResult {
 }
 
 const tick = () => new Promise<void>((res) => setTimeout(res, 0));
-
+// Episode aggregation: mean rewards peak one-offs (lucky spawns); worst-episode
+// rewards genomes that lap from every spawn — the finalize objective. Pure.
+export function aggregateEpisodes(fits: number[], robust: boolean): number {
+  if (!fits.length) return -Infinity;
+  return robust ? Math.min(...fits) : fits.reduce((a, f) => a + f, 0) / fits.length;
+}
 export async function runEpoch(
   idx: TrackIndex,
   phys: PhysicsParams,
@@ -119,12 +127,12 @@ export async function runEpoch(
   for (let i = 0; i < pop.length; i++) {
     if (stopped()) break;
     const g = pop[i];
-    let f = 0;
+    const fits: number[] = [];
     for (let e = 0; e < cfg.episodes; e++) {
       const policy = (obs: number[]): Control => forwardGenome(g, obs);
-      f += fitnessOf(await runEpisode(idx, phys, policy, { laps: cfg.laps, maxTime: cfg.timeout, spawnFrac: spawnFracs[e], spawnSpeed: spawnFracs[e] == null ? 0 : phys.vMax * 0.35 }));
+      fits.push(fitnessOf(await runEpisode(idx, phys, policy, { laps: cfg.laps, maxTime: cfg.timeout, spawnFrac: spawnFracs[e], spawnSpeed: spawnFracs[e] == null ? 0 : phys.vMax * 0.35 })));
     }
-    scored.push({ g: pop[i], f: f / cfg.episodes });
+    scored.push({ g: pop[i], f: aggregateEpisodes(fits, cfg.robust) });
     if (i % 8 === 7) await tick();
   }
   if (!scored.length) return { pop, best: pop[0].slice(), bestFitness: -Infinity, avgFitness: -Infinity, partial: true };
@@ -143,7 +151,7 @@ export async function runEpoch(
     // 70% uniform crossover (combine sub-skills) + 30% asexual (fine-tune without
     // shattering co-adapted weights): all-crossover churns too hard to converge
     // precise maneuvers like hairpin entries.
-    const child = rand() < 0.7 ? crossover(pick(), pick(), rand) : pick().slice();
+    const child = rand() < cfg.crossoverRate ? crossover(pick(), pick(), rand) : pick().slice();
     next.push(mutateGenome(child, cfg.sigma, rand));
     if (next.length % 8 === 0) await tick();
   }

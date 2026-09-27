@@ -104,6 +104,7 @@ export function drawRaceScene(
   ctx: CanvasRenderingContext2D, W: number, H: number,
   centerline: [number, number][], left: Pt[], right: Pt[],
   ribbonPoly: Pt[],
+  bg?: { img: HTMLImageElement; x: number; y: number; s: number } | null,
 ) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const [x, y] of centerline) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
@@ -111,7 +112,11 @@ export function drawRaceScene(
   const s = Math.min((W - 2 * m) / Math.max(1, x1 - x0), (H - 2 * m) / Math.max(1, y1 - y0));
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, W, H);
-  ctx.setTransform(s, 0, 0, s, m - x0 * s, m - y0 * s);
+  // Center the leftover space: a wide canvas no longer pins the track top-left.
+  const ox = m + ((W - 2 * m) - (x1 - x0) * s) / 2 - x0 * s;
+  const oy = m + ((H - 2 * m) - (y1 - y0) * s) / 2 - y0 * s;
+  ctx.setTransform(s, 0, 0, s, ox, oy);
+  if (bg && bg.img.naturalWidth > 0) ctx.drawImage(bg.img, bg.x, bg.y, bg.img.naturalWidth * bg.s, bg.img.naturalHeight * bg.s);
   const path = (poly: [number, number][], close: boolean) => {
     ctx.beginPath();
     poly.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));

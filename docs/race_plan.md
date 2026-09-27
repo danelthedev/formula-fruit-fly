@@ -15,18 +15,17 @@ a placeholder button. Client-only (Vite + TS + Canvas + TF.js WebGL), no backend
    - Laps: number input 1–10, default 3.
    - `Begin practice` validates (track + ≥1 team) and locks the selections in.
 3. **Practice session** (the training process):
-   - `Start training` runs GA per team on the selected track with team physics;
-     `Stop` ends it (weights kept). `Import weights` per team from a saved file
-     skips retraining for that team.
-   - Live panel: epoch counter, best/avg fitness sparkline per selected team.
-   - `Preview every X epochs` (number input, default 0 = off): at each Xth epoch
-     boundary training pauses and the current-epoch best candidate of EVERY team
-     drives one lap simultaneously (ghost cars, no collisions), then training resumes.
-   - `Current Epoch Preview` button: pauses immediately, same simultaneous preview
-     of best-so-far this epoch, resumes on `Resume training`.
-   - `Export weights` per team (JSON file). Any team with weights (trained or
-     imported) counts as ready.
-   - `Start Qualifying` enabled once every participating team is ready.
+3. **Practice session** (programmed, hands-off): `Begin practice` starts every team
+   at once — no per-team controls, no charts. The pane shows the track, a live
+   leaderboard (best/avg/epoch per team), and `Epoch x/y` at the top.
+   - Explore 90 epochs of free evolution (laps typically land ~epoch 55-60), then
+     each team auto-switches to finalize (σ frozen, no crossover, worst-episode
+     selection) for 40 more. If a team hasn't lapped by the switch (best < 900),
+     explore extends +10 (max 3×) instead of finalizing blind.
+   - `Preview every 10 epochs` (0 = off): training pauses and every island's
+     champion drives (ghost cars, no collisions), then training resumes.
+   - Weights backup (export/import) lives on the setup team rows.
+   - `Start Qualifying` enables when every team completes the program.
 4. **Qualifying session**: drivers go out SEQUENTIALLY, one flying lap each, with a
    timeout (3× expected lap from track length / team vMax). Live quali board on the
    LEFT side of the track: Pos / Driver (Team) / Time-or-Gap / status; DNFs sorted

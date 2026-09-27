@@ -173,7 +173,7 @@ export const saveWeights = async (teamId: string, w: WeightsFile): Promise<void>
 };
 export const loadWeights = async (teamId: string): Promise<WeightsFile | null> => {
   const d = parse<WeightsFile>(await kvGet(wkey(teamId)));
-  return d && d.v === 1 && typeof d.teamId === 'string' && Array.isArray(d.weights) ? d : null;
+  return d && d.v === 2 && typeof d.teamId === 'string' && Array.isArray(d.weights) ? d : null; // v1 = pre-real-rate physics: quarantined
 };
 export const savePopulation = async (teamId: string, pop: number[][]): Promise<void> => {
   await kvSet(pkey(teamId), JSON.stringify(pop)).catch(() => {});
@@ -181,4 +181,8 @@ export const savePopulation = async (teamId: string, pop: number[][]): Promise<v
 export const loadPopulation = async (teamId: string): Promise<number[][] | null> => {
   const d = parse<number[][]>(await kvGet(pkey(teamId)));
   return Array.isArray(d) && d.every((g) => Array.isArray(g)) ? d : null;
+};
+export const deleteWeights = async (teamId: string): Promise<void> => {
+  await kvSet(wkey(teamId), null).catch(() => {});
+  await kvSet(pkey(teamId), null).catch(() => {});
 };
