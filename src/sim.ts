@@ -5,7 +5,7 @@ import type { PhysicsParams } from './teams.ts';
 // ---- Shared fixed-timestep sim core (Stories 3-4: practice, quali, race) ----
 // Arcade bicycle-ish model, dt = 1/60, seeded RNG for deterministic replays.
 export const DT = 1 / 60;
-const WHEELBASE = 32; // px, car length scale
+const WHEELBASE = 4; // px: min turn radius = WB/tan(steerMax) ≈ 21/12/7px across specs — must clear ~11px kink apexes; 6px gated them behind high specs
 const RAY_RANGE = 300; // px, sensor normalization
 const RAY_COUNT = 9; // over ±90°
 
@@ -26,6 +26,7 @@ export interface TrackIndex {
   track: Track; n: number; pts: Pt[]; cum: number[]; total: number;
   left: Pt[]; right: Pt[]; gates: Pt[]; gateFr: number[];
   gateOrder: { fr: number; g: Pt }[]; // gates sorted by arc fraction (binary-searched per step)
+  curveCum: number[]; curveTotal: number; // per-point turning-angle CDF: corner-biased spawn sampling
   grid: Map<number, number[]>; cell: number;
 }
 
@@ -61,7 +62,29 @@ export function makeTrackIndex(track: Track): TrackIndex {
   const gateOrder = gates
     .map((g, i) => ({ fr: gateFr[i] ?? i / Math.max(1, gates.length), g }))
     .sort((a, b) => a.fr - b.fr);
-  return { track, n, pts, cum, total: cum[n], left, right, gates, gateFr, gateOrder, grid, cell };
+  // per-point turning angle + CDF: corners draw spawn samples, straights need no practice
+  const curveCum = new Array<number>(n);
+  let curveTotal = 0;
+  for (let i = 0; i < n; i++) {
+    const a = pts[(i - 1 + n) % n], b = pts[i], c = pts[(i + 1) % n];
+    const h1 = Math.atan2(b[1] - a[1], b[0] - a[0]);
+    const h2 = Math.atan2(c[1] - b[1], c[0] - b[0]);
+    let d = Math.abs(h2 - h1);
+    if (d > Math.PI) d = 2 * Math.PI - d;
+    curveTotal += d;
+    curveCum[i] = curveTotal;
+  }
+  return { track, n, pts, cum, total: cum[n], left, right, gates, gateFr, gateOrder, curveCum, curveTotal, grid, cell };
+}
+
+// Spawn fraction for training variety: 75% corner-biased (CDF over turning
+// angle), 25% uniform (straights still sampled). Seeded: deterministic per epoch.
+export function sampleSpawnFrac(idx: TrackIndex, rand: () => number): number {
+  if (!(idx.curveTotal > 0) || rand() < 0.25) return rand();
+  const x = rand() * idx.curveTotal;
+  let lo = 0, hi = idx.curveCum.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (idx.curveCum[m] < x) lo = m + 1; else hi = m; }
+  return Math.min(lo, idx.n - 1) / idx.n;
 }
 
 export interface Located { s: number; frac: number; dist: number; tx: number; ty: number; hw: number; cx: number; cy: number; bi: number }
@@ -104,11 +127,20 @@ function finish(idx: TrackIndex, bi: number, bt: number, best: number): Located 
 // Spawn at the start line, heading along the tangent.
 export function spawn(idx: TrackIndex): { car: CarState; s0: number } {
   const t = idx.track;
-  const i = t.startS == null ? 0 : t.startS % idx.n;
+  return spawnAt(idx, t.startS == null ? 0 : t.startS / idx.n);
+}
+
+// Spawn at an explicit arc fraction (training variety): same tangent logic.
+// Optional speed starts the car rolling along the tangent — corner episodes
+// begin at pace so braking is immediately necessary (no cruise-then-crash).
+export function spawnAt(idx: TrackIndex, frac: number, speed = 0): { car: CarState; s0: number } {
+  const t = idx.track;
+  const i = ((Math.floor(frac * idx.n) % idx.n) + idx.n) % idx.n;
   const p = t.centerline[i];
   const q = t.centerline[(i + 3) % idx.n], r = t.centerline[(i - 3 + idx.n) % idx.n];
-  const dx = q[0] - r[0], dy = q[1] - r[1], L = Math.hypot(dx, dy) || 1;
-  return { car: { x: p[0], y: p[1], heading: Math.atan2(dy, dx), vx: 0, vy: 0 }, s0: idx.cum[i] };
+  const dx = q[0] - r[0], dy = q[1] - r[1];
+  const heading = Math.atan2(dy, dx);
+  return { car: { x: p[0], y: p[1], heading, vx: Math.cos(heading) * speed, vy: Math.sin(heading) * speed }, s0: idx.cum[i] };
 }
 
 export function stepCar(car: CarState, c: Control, p: PhysicsParams): void {
@@ -183,8 +215,8 @@ export function observe(idx: TrackIndex, car: CarState, loc: Located): number[] 
   return out;
 }
 
-export interface EpisodeOpts { laps?: number; maxTime?: number }
-export interface EpisodeResult { progress: number; time: number; steps: number; done: 'lap' | 'crash' | 'timeout' }
+export interface EpisodeOpts { laps?: number; maxTime?: number; spawnFrac?: number | null; spawnSpeed?: number }
+export interface EpisodeResult { progress: number; time: number; steps: number; done: 'lap' | 'crash' | 'timeout'; endSpeed: number; decel: number; jitter?: number }
 
 // One episode: spawn, then observe → act → step until lap(s), crash or timeout.
 // Progress counts signed laps from the spawn point (unwrapped arc fraction).
@@ -197,8 +229,15 @@ export async function runEpisode(
   opts: EpisodeOpts = {},
 ): Promise<EpisodeResult> {
   const laps = opts.laps ?? 1, maxTime = opts.maxTime ?? 60;
-  const { car } = spawn(idx);
+  const { car } = opts.spawnFrac == null ? spawn(idx) : spawnAt(idx, opts.spawnFrac, opts.spawnSpeed ?? 0);
   let hint = -1, prevFrac: number | null = null, prog = 0, time = 0, steps = 0;
+  let prevStr: number | null = null, jitSum = 0, jitN = 0, lastProg5 = 0;
+  const vHist: number[] = [Math.hypot(car.vx, car.vy)];
+  const endState = () => {
+    const end = Math.hypot(car.vx, car.vy);
+    const old = vHist.length > 1 ? vHist[vHist.length - 2] : vHist[0];
+    return { endSpeed: end, decel: Math.max(0, old - end), jitter: jitN ? jitSum / jitN : 0 };
+  };
   for (;;) {
     const loc = locate(idx, car.x, car.y, hint);
     hint = loc.bi;
@@ -208,11 +247,16 @@ export async function runEpisode(
     else if (d < -0.5) d += 1;
     prog += d;
     prevFrac = loc.frac;
-    if (loc.dist > loc.hw) return { progress: prog, time, steps, done: 'crash' };
-    if (prog >= laps) return { progress: prog, time, steps, done: 'lap' };
-    if (time >= maxTime) return { progress: prog, time, steps, done: 'timeout' };
-    if (time > 8 && prog < 0.02) return { progress: prog, time, steps, done: 'crash' }; // stalled: parked or crawling, don't burn the full timeout
-    stepCar(car, policy(observe(idx, car, loc), car), phys);
+    if (loc.dist > loc.hw) return { progress: prog, time, steps, done: 'crash', ...endState() };
+    if (prog >= laps) return { progress: prog, time, steps, done: 'lap', ...endState() };
+    if (time >= maxTime) return { progress: prog, time, steps, done: 'timeout', ...endState() };
+    if (time > 8 && prog < 0.02) return { progress: prog, time, steps, done: 'crash', ...endState() }; // stalled: parked or crawling, don't burn the full timeout
+    if (steps % 300 === 0 && steps > 0) { if (prog - lastProg5 < 0.01) return { progress: prog, time, steps, done: 'crash', ...endState() }; lastProg5 = prog; } // parked mid-lap: <0.01 frac per 5s = stuck
+    const ctl = policy(observe(idx, car, loc), car);
+    if (prevStr != null) { jitSum += Math.abs(ctl[2] - prevStr); jitN++; }
+    prevStr = ctl[2];
+    stepCar(car, ctl, phys);
+    if (steps % 30 === 29) vHist.push(Math.hypot(car.vx, car.vy));
     time += DT;
     steps++;
     if (steps % 120 === 0) await yieldTick();

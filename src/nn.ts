@@ -69,6 +69,15 @@ export function mutateGenome(g: Float32Array, sigma: number, rand: () => number)
   return out;
 }
 
+// Reintroduce brake expression: copy genome with brake output bias boosted.
+// Used for restart immigrants so crossover can combine braking with learned
+// steering when the whole population has converged to never braking.
+export function withBrakeBias(g: Float32Array, amount: number): Float32Array {
+  const out = g.slice();
+  out[B3 + 1] += amount;
+  return out;
+}
+
 // Weights file format (IDB + JSON export/import). Arch tag guards mismatches.
 export interface WeightsFile { v: 1; teamId: string; teamName: string; arch: number[]; weights: number[] }
 export function encodeWeightsFile(teamId: string, teamName: string, genome: Float32Array | number[]): WeightsFile {

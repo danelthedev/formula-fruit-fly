@@ -2,8 +2,8 @@ import { buildMask, extractCore, largestComponent, prune, simplifySkeleton, thin
 import { blendSeam, checkpoints, closeLoop, dist, distToTrack, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, sanitizePoints, sanitizeTrack, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths, widthAt } from './track.ts';
 import type { Pt, Track } from './track.ts';
 import { deleteTrack, listTracks, loadBg, loadDraft, loadPieces, loadPopulation, loadRaceCfg, loadRaceSession, loadTeams, loadView, loadWeights, ready as storeReady, saveBg, saveDraft, savePieces, savePopulation, saveRaceCfg, saveRaceSession, saveTeams, saveTrack, saveView, saveWeights } from './storage.ts';
-import { initPop, runEpoch } from './ga.ts';
-import { buildNet, decodeWeightsFile, encodeWeightsFile, forwardGenome, mutateGenome } from './nn.ts';
+import { adaptSigma, epochTimeout, initPop, migrateIslands, restartPop, runEpoch } from './ga.ts';
+import { buildNet, decodeWeightsFile, encodeWeightsFile, forwardGenome, mutateGenome, randomGenome, withBrakeBias } from './nn.ts';
 import type { EpochResult, GAConfig } from './ga.ts';
 import type { GenomeNet } from './nn.ts';
 import { locate, makeTrackIndex, mulberry32, observe, spawn, stepCar, DT } from './sim.ts';
@@ -897,17 +897,31 @@ async function renderRaces() {
   gid('race-setup-hint').textContent = '';
 }
 // ---- practice session (Story 3, subtask 5) ----
+interface Island {
+  pop: Float32Array[];
+  best: Float32Array | null;
+  bestFit: number;
+  sigma: number | null;
+  stasis: number;
+  seed: number;
+  epoch: number;
+  lastAvg: number;
+}
 interface TeamTrain {
   teamId: string;
   status: 'idle' | 'training' | 'stopped';
-  pop: Float32Array[];
-  epoch: number;
-  best: Float32Array | null;
+  pop: Float32Array[]; // mirrored best-island pop (single place readers look)
+  epoch: number; // max island epoch
+  best: Float32Array | null; // best island best (fairly crowned)
   bestFit: number;
   lastAvg: number;
   histBest: number[];
   histAvg: number[];
-  seed: number;
+  sigma: number | null;
+  stasis: number;
+  islands: Island[];
+  hof: { genome: Float32Array; fitness: number; epoch: number } | null; // hall of fame: best confirmed champion ever
+  migAt: number; // max island epoch at last migration
   card?: { status: HTMLElement; stat: HTMLElement; canvas: HTMLCanvasElement; toggle: HTMLButtonElement; exp: HTMLButtonElement };
 }
 let practiceTeams: TeamTrain[] = [];
@@ -916,6 +930,11 @@ let practiceNet: GenomeNet | null = null;
 let practiceIdx: TrackIndex | null = null;
 let weightsImportTarget: string | null = null;
 
+function islandCount(): number {
+  const el = document.getElementById('in-ga-islands') as HTMLInputElement | null;
+  const v = el ? Number(el.value) : NaN;
+  return Number.isFinite(v) ? Math.min(4, Math.max(1, Math.round(v))) : 3;
+}
 function practiceCfg(): GAConfig {
   const num = (id: string, dflt: number) => {
     const v = Number((gid(id) as HTMLInputElement).value);
@@ -926,7 +945,7 @@ function practiceCfg(): GAConfig {
     popSize,
     elite: Math.min(4, Math.max(1, popSize - 1)),
     sigma: Math.min(0.5, Math.max(0.005, num('in-ga-sigma', 0.05))),
-    episodes: 3, timeout: 30, laps: 1,
+    episodes: 2, timeout: 20, laps: 1,
   };
 }
 
@@ -940,6 +959,7 @@ function stopPracticeAll() {
 // weights persist — only the event itself is forgotten.
 function resetRaceSession() {
   stopPracticeAll();
+  terminateAllWorkers(); // in-flight epochs die; their late results are dropped (team left)
   if (quali) quali.aborted = true;
   quali = null;
   qualiIdx = null;
@@ -1004,7 +1024,19 @@ async function enterPractice(): Promise<boolean> {
     } else {
       pop = initPop(net, cfg.popSize, (Math.random() * 2 ** 31) | 0);
     }
-    practiceTeams.push({ teamId: id, status: best ? 'stopped' : 'idle', pop, epoch: 0, best, bestFit: -Infinity, lastAvg: NaN, histBest: [], histAvg: [], seed: (Math.random() * 2 ** 31) | 0 });
+    const K = islandCount();
+    const islands: Island[] = [];
+    for (let i = 0; i < K; i++) {
+      if (i === 0) {
+        islands.push({ pop: pop.map((g) => g.slice()), best: best ? best.slice() : null, bestFit: -Infinity, sigma: null, stasis: 0, seed: (Math.random() * 2 ** 31) | 0, epoch: 0, lastAvg: NaN });
+      } else if (best) {
+        const b = best.slice();
+        islands.push({ pop: [b.slice(), ...Array.from({ length: Math.max(0, cfg.popSize - 1) }, () => mutateGenome(b, cfg.sigma, Math.random))], best: b.slice(), bestFit: -Infinity, sigma: null, stasis: 0, seed: (Math.random() * 2 ** 31) | 0, epoch: 0, lastAvg: NaN });
+      } else {
+        islands.push({ pop: initPop(net, cfg.popSize, (Math.random() * 2 ** 31) | 0), best: null, bestFit: -Infinity, sigma: null, stasis: 0, seed: (Math.random() * 2 ** 31) | 0, epoch: 0, lastAvg: NaN });
+      }
+    }
+    practiceTeams.push({ teamId: id, status: best ? 'stopped' : 'idle', pop, epoch: 0, best: best ? best.slice() : null, bestFit: -Infinity, lastAvg: NaN, histBest: [], histAvg: [], sigma: null, stasis: 0, islands, hof: null, migAt: 0 });
   }
   seedDonors = [];
   for (const t of teams) {
@@ -1082,12 +1114,13 @@ async function seedFromDonor(teamId: string, donorId: string) {
   if (!st || !donor || !team || st.best) return;
   const cfg = practiceCfg();
   const b = donor.weights.slice();
-  st.best = b.slice();
-  st.bestFit = -Infinity;
-  st.pop = [b, ...Array.from({ length: Math.max(1, cfg.popSize - 1) }, () => mutateGenome(b, cfg.sigma, Math.random))];
+  reseedTeamIslands(st, b, cfg);
   st.status = 'stopped';
-  await saveWeights(teamId, encodeWeightsFile(teamId, team.name, st.best));
-  await savePopulation(teamId, st.pop.map((g) => [...g]));
+  const sb = st.best; // reseed just set it; guard for tsc
+  if (sb) {
+    await saveWeights(teamId, encodeWeightsFile(teamId, team.name, sb));
+    await savePopulation(teamId, st.pop.map((g) => [...g]));
+  }
   say(`${team.name} seeded from ${donor.name} — skill transfers, training adapts it to this track.`);
   buildPracticeCards();
   updateQualiGate();
@@ -1096,8 +1129,8 @@ async function seedFromDonor(teamId: string, donorId: string) {
 function updatePracticeCards() {
   for (const st of practiceTeams) {
     if (!st.card) continue;
-    st.card.status.textContent = st.status === 'training' ? `training · epoch ${st.epoch}` : st.status === 'idle' ? 'idle' : 'stopped · weights kept';
-    st.card.stat.textContent = `best ${fmtFit(st.bestFit)} · avg ${fmtFit(st.lastAvg)}`;
+    st.card.status.textContent = st.status === 'training' ? `training · epoch ${st.epoch} (isl ${st.islands.map((s) => s.epoch).join('/')})` : st.status === 'idle' ? 'idle' : 'stopped · weights kept';
+    st.card.stat.textContent = `best ${fmtFit(st.bestFit)} · avg ${fmtFit(st.lastAvg)} · σ ${st.sigma != null ? st.sigma.toFixed(3) : '—'}` + (st.hof ? ` · hof ${fmtFit(st.hof.fitness)}` : '');
     st.card.toggle.textContent = st.status === 'training' ? 'Stop' : 'Start';
     st.card.exp.disabled = !st.best;
     spark(st.card.canvas, st.histBest, st.histAvg);
@@ -1107,15 +1140,15 @@ function updatePracticeCards() {
 function toggleTeam(id: string) {
   const st = practiceTeams.find((s) => s.teamId === id);
   if (!st || !practiceIdx || !practiceNet) return;
-  if (st.status === 'training') st.status = 'stopped';
+  if (st.status === 'training') { st.status = 'stopped'; for (let i = 0; i < st.islands.length; i++) { try { teamWorkers.get(`${id}:${i}`)?.postMessage({ type: 'stop' }); } catch { /* worker gone */ } } }
   else { st.status = 'training'; updatePracticeCards(); void scheduler(); }
   updatePracticeCards();
 }
 
-// Central scheduler: one epoch per training team per round, so auto-previews
-// and pause/resume coordinate across teams (per-team loops can't do that).
+// Central scheduler: teams train in parallel (one worker each), one epoch per
+// training team per round, so auto-previews and pause/resume stay coordinated.
 let schedActive = false;
-let epochActive = false;
+const inFlight = new Set<string>(); // teamIds with a dispatched epoch (replaces the old single epochActive flag)
 let previewHold = false;
 let previewRunning = false;
 let previewAbort = false;
@@ -1123,44 +1156,181 @@ let previewActive = false;
 const previewedEpochs = new Map<string, number>();
 const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 
+// One module worker per team, created lazily. Null when workers are unavailable
+// (blocked CSP/file://): that team falls back to inline epochs on the UI thread.
+const teamWorkers = new Map<string, Worker | null>();
+let jobSeq = 0;
+function getWorker(teamId: string): Worker | null {
+  if (!teamWorkers.has(teamId)) {
+    try {
+      const w = new Worker(new URL('./train-worker.ts', import.meta.url), { type: 'module' });
+      w.onerror = () => { teamWorkers.set(teamId, null); };
+      teamWorkers.set(teamId, w);
+    } catch { teamWorkers.set(teamId, null); }
+  }
+  return teamWorkers.get(teamId) ?? null;
+}
+function stopAllWorkers() {
+  for (const w of teamWorkers.values()) { try { w?.postMessage({ type: 'stop' }); } catch { /* gone */ } }
+}
+function terminateAllWorkers() {
+  for (const w of teamWorkers.values()) { try { w?.terminate(); } catch { /* gone */ } }
+  teamWorkers.clear();
+  inFlight.clear();
+}
+function runWorkerEpoch(w: Worker, job: { idx: TrackIndex; phys: PhysicsParams; pop: Float32Array[]; cfg: GAConfig; seed: number }): Promise<EpochResult> {
+  return new Promise((resolve, reject) => {
+    const jobId = ++jobSeq;
+    const to = window.setTimeout(() => reject(new Error('epoch timed out')), 1000 * 60 * 30);
+    const handler = (e: MessageEvent) => {
+      const m = e.data as { type: string; jobId: number; ok: boolean; result?: EpochResult; error?: string };
+      if (!m || m.type !== 'done' || m.jobId !== jobId) return;
+      w.removeEventListener('message', handler);
+      window.clearTimeout(to);
+      if (m.ok && m.result) resolve(m.result);
+      else reject(new Error(m.error ?? 'epoch failed'));
+    };
+    w.addEventListener('message', handler);
+    w.postMessage({ type: 'epoch', jobId, ...job });
+  });
+}
+
 async function scheduler() {
   if (schedActive) return;
   schedActive = true;
   try {
     for (;;) {
-      if (previewHold) { await runPreviewCycle(); await sleep(200); continue; }
+      if (previewHold) { stopAllWorkers(); await runPreviewCycle(); await sleep(200); continue; }
       const active = practiceTeams.filter((s) => s.status === 'training');
       if (!active.length) return;
+      let dispatched = false;
+      const key = (t: TeamTrain, i: number) => `${t.teamId}:${i}`;
       for (const st of active) {
         if (previewHold) break;
         if (st.status !== 'training') continue;
-        await trainOneEpoch(st);
+        // migrate champions between islands when settled (no island in flight)
+        const maxEp = st.islands.length ? Math.max(...st.islands.map((s) => s.epoch)) : 0;
+        if (maxEp - st.migAt >= 5 && maxEp > 0 && st.islands.every((_, i) => !inFlight.has(key(st, i)))) {
+          migrateIslands(st.islands.map((s) => s.pop), st.islands.map((s) => s.best), practiceCfg().elite, Math.random);
+          st.migAt = maxEp;
+        }
+        for (let i = 0; i < st.islands.length; i++) {
+          if (previewHold) break;
+          if (st.status !== 'training' || inFlight.has(key(st, i))) continue;
+          inFlight.add(key(st, i));
+          dispatched = true;
+          void trainIslandEpoch(st, st.islands[i], i).finally(() => { inFlight.delete(key(st, i)); updatePracticeCards(); });
+        }
       }
+      await sleep(dispatched ? 100 : 250);
+      if (!practiceTeams.some((s) => s.status === 'training')) return;
     }
   } finally { schedActive = false; }
 }
 
-async function trainOneEpoch(st: TeamTrain) {
+function refreshTeamBest(st: TeamTrain) {
+  if (!st.islands.length) return;
+  let bi = 0;
+  for (let i = 1; i < st.islands.length; i++) {
+    if ((st.islands[i].bestFit ?? -Infinity) > (st.islands[bi].bestFit ?? -Infinity)) bi = i;
+  }
+  const b = st.islands[bi];
+  st.best = b.best ? b.best.slice() : null;
+  st.bestFit = b.bestFit;
+  st.lastAvg = b.lastAvg;
+  st.epoch = Math.max(...st.islands.map((s) => s.epoch));
+  st.sigma = b.sigma; st.stasis = b.stasis;
+  st.pop = b.pop;
+}
+
+// Seed (or reseed) every island from one genome: champion copy + mutants.
+function reseedTeamIslands(st: TeamTrain, g: Float32Array, cfg: GAConfig) {
+  st.islands = st.islands.map(() => ({
+    pop: [g.slice(), ...Array.from({ length: Math.max(0, cfg.popSize - 1) }, () => mutateGenome(g, cfg.sigma, Math.random))],
+    best: g.slice(), bestFit: -Infinity, sigma: null, stasis: 0,
+    seed: (Math.random() * 2 ** 31) | 0, epoch: 0, lastAvg: NaN,
+  }));
+  st.best = g.slice(); st.bestFit = -Infinity; st.lastAvg = NaN;
+  st.histBest = []; st.histAvg = []; st.hof = null; st.migAt = 0;
+  st.sigma = null; st.stasis = 0; st.epoch = 0;
+  refreshTeamBest(st);
+}
+
+async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
   const team = teams.find((t) => t.id === st.teamId);
   if (!team || !practiceIdx || !practiceNet) return;
+  const net = practiceNet; // narrowed copy for closures below
   const phys = physicsFor(team);
   const cfg = practiceCfg();
-  while (st.pop.length < cfg.popSize && st.best) st.pop.push(mutateGenome(st.best, cfg.sigma, Math.random));
-  if (st.pop.length > cfg.popSize) st.pop.length = cfg.popSize;
-  epochActive = true;
+  if (isl.sigma == null) isl.sigma = cfg.sigma; // first epoch: take the UI rate, then adapt
+  const hof = st.hof;
+  if (hof && isl.stasis >= 10) {
+    // champion + near mutants + fresh random immigrants: the immigrants bring
+    // desaturated priors (throttle!) that crossover can combine with learned skills
+    const near = restartPop(hof.genome, Math.max(2, Math.ceil(cfg.popSize / 2)), cfg.sigma, Math.random);
+    const nFresh = Math.max(0, cfg.popSize - near.length);
+    const fresh = Array.from({ length: nFresh }, (_, i) =>
+      i % 2 === 0
+        ? randomGenome(net, Math.random)
+        : mutateGenome(withBrakeBias(hof.genome, 1.0 + Math.random() * 1.5), cfg.sigma, Math.random));
+    isl.pop = [...near, ...fresh];
+    isl.stasis = 0; isl.sigma = cfg.sigma;
+    say(`${team.name} island ${islIdx + 1}: no progress for 10 epochs — restarting around its hall of fame.`);
+  }
+  const ecfg = { ...cfg, sigma: isl.sigma, timeout: epochTimeout(practiceIdx.total, cfg.laps) };
+  while (isl.pop.length < ecfg.popSize && isl.best) isl.pop.push(mutateGenome(isl.best, isl.sigma, Math.random));
+  if (isl.pop.length > ecfg.popSize) isl.pop.length = ecfg.popSize;
+  updatePracticeCards();
+  const key = `${st.teamId}:${islIdx}`;
+  const w = getWorker(key);
+  const stop = () => st.status !== 'training' || previewHold;
   let r: EpochResult;
   try {
-    r = await runEpoch(practiceIdx, phys, st.pop, cfg, (st.seed = (st.seed + 1) >>> 0), () => st.status !== 'training' || previewHold);
-  } finally { epochActive = false; }
-  st.pop = r.pop;
+    const seed = (isl.seed = (isl.seed + 1) >>> 0);
+    r = w
+      ? await runWorkerEpoch(w, { idx: practiceIdx, phys, pop: isl.pop, cfg: ecfg, seed })
+      : await runEpoch(practiceIdx, phys, isl.pop, ecfg, seed, stop);
+  } catch {
+    // worker died mid-epoch: drop it, retry once inline (unless the team is gone/stopped)
+    if (w) { try { w.terminate(); } catch { /* gone */ } teamWorkers.delete(key); }
+    if (!practiceTeams.some((s) => s.teamId === st.teamId) || (!previewHold && st.status !== 'training')) { updatePracticeCards(); return; }
+    const seed2 = (isl.seed = (isl.seed + 1) >>> 0);
+    r = await runEpoch(practiceIdx, phys, isl.pop, ecfg, seed2, stop);
+  }
+  if (!practiceTeams.some((s) => s.teamId === st.teamId)) return; // team left mid-epoch: drop the result
+  isl.pop = r.pop;
   if (r.partial) { updatePracticeCards(); return; }
-  st.epoch++;
+  isl.epoch++;
+  isl.lastAvg = r.avgFitness;
   st.histBest.push(r.bestFitness);
   st.histAvg.push(r.avgFitness);
   st.lastAvg = r.avgFitness;
-  if (!st.best || r.bestFitness > st.bestFit) { st.best = r.best; st.bestFit = r.bestFitness; }
-  await saveWeights(st.teamId, encodeWeightsFile(st.teamId, team.name, st.best));
-  await savePopulation(st.teamId, st.pop.map((g) => [...g]));
+  if (!isl.best || r.bestFitness > isl.bestFit) {
+    // second opinion: re-score the candidate on fresh spawns and crown the mean,
+    // so lucky-spawn one-offs can't freeze as champions.
+    let confirmFit = r.bestFitness;
+    try {
+      const cseed = (isl.seed = (isl.seed + 1) >>> 0);
+      const w2 = getWorker(key);
+      const rc = w2
+        ? await runWorkerEpoch(w2, { idx: practiceIdx, phys, pop: [r.best.slice()], cfg: ecfg, seed: cseed })
+        : await runEpoch(practiceIdx, phys, [r.best.slice()], ecfg, cseed, stop);
+      if (!practiceTeams.some((s) => s.teamId === st.teamId)) return;
+      if (!rc.partial) confirmFit = (r.bestFitness + rc.bestFitness) / 2;
+    } catch { /* confirm failed: fall back to single eval */ }
+    isl.best = r.best; isl.bestFit = confirmFit; isl.stasis = 0;
+    isl.sigma = adaptSigma(isl.sigma ?? cfg.sigma, cfg.sigma, true, 0);
+    if (!st.hof || confirmFit > st.hof.fitness) st.hof = { genome: r.best.slice(), fitness: confirmFit, epoch: isl.epoch };
+  } else {
+    isl.stasis++;
+    isl.sigma = adaptSigma(isl.sigma ?? cfg.sigma, cfg.sigma, false, isl.stasis);
+  }
+  refreshTeamBest(st);
+  const sb = st.best; // crowned above when any island completed; guard for tsc
+  if (sb) {
+    await saveWeights(st.teamId, encodeWeightsFile(st.teamId, team.name, sb));
+    await savePopulation(st.teamId, st.pop.map((g) => [...g]));
+  }
   if (st.best && !seedDonors.some((d) => d.id === st.teamId)) {
     seedDonors.push({ id: st.teamId, name: team.name, weights: st.best.slice() }); // new donor: weightless teams can seed from it
     buildPracticeCards();
@@ -1179,9 +1349,10 @@ async function requestManualPreview() {
   if (previewRunning) return;
   if (!practiceTeams.some((s) => s.best)) { say('Nothing to preview yet.'); return; }
   previewHold = true;
+  stopAllWorkers(); // in-flight worker epochs abort at the next genome boundary
   updatePracticeCards();
   const t0 = Date.now();
-  while (epochActive && Date.now() - t0 < 30000) await sleep(150);
+  while (inFlight.size > 0 && Date.now() - t0 < 30000) await sleep(150);
   if (schedActive) {
     // scheduler picks up the hold and runs the cycle; wait for it to clear
     while (previewHold && !previewRunning && Date.now() - t0 < 180000) await sleep(200);
@@ -1334,9 +1505,8 @@ function exportTeamWeights(teamId: string) {
     const wf = decodeWeightsFile(JSON.parse(await f.text()), practiceNet.size);
     if (!wf) { say('Import failed: bad weights file.'); return; }
     const cfg = practiceCfg();
-    st.best = new Float32Array(wf.weights); st.bestFit = -Infinity;
-    st.pop = [st.best.slice(), ...Array.from({ length: Math.max(0, cfg.popSize - 1) }, () => mutateGenome(st.best!, cfg.sigma, Math.random))];
-    st.epoch = 0; st.histBest = []; st.histAvg = []; st.lastAvg = NaN; st.status = 'stopped';
+    reseedTeamIslands(st, new Float32Array(wf.weights), cfg);
+    st.status = 'stopped';
     await saveWeights(st.teamId, wf);
     await savePopulation(st.teamId, st.pop.map((g) => [...g]));
     updatePracticeCards(); updateQualiGate();

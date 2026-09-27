@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { blankTeam, physicsFor } from '../src/teams.ts';
 import { pointAt } from '../src/track.ts';
 import type { Track } from '../src/track.ts';
-import { locate, makeTrackIndex, observe, runEpisode } from '../src/sim.ts';
+import { locate, makeTrackIndex, mulberry32, observe, runEpisode, sampleSpawnFrac, spawn, spawnAt } from '../src/sim.ts';
 import type { CarState, Control } from '../src/sim.ts';
 
 const oval = (): Track => {
@@ -68,4 +68,66 @@ test('observe returns 16 normalized dims', () => {
   assert.equal(obs.length, 16);
   assert.ok(obs.every((v) => Number.isFinite(v)), 'all finite');
   assert.ok(obs.slice(3, 12).every((v) => v >= 0 && v <= 1), 'rays in [0,1]');
+});
+
+test('spawnAt wraps fractions; spawnFrac episodes record endSpeed', async () => {
+  const idx = makeTrackIndex(oval());
+  const a = spawnAt(idx, 0.25);
+  const b = spawnAt(idx, 1.25);
+  assert.deepEqual([a.car.x, a.car.y], [b.car.x, b.car.y]); // wraps like 0.25
+  assert.deepEqual([spawn(idx).car.x, spawn(idx).car.y], [spawnAt(idx, 0).car.x, spawnAt(idx, 0).car.y]);
+  const r = await runEpisode(idx, phys, () => [1, 0, 0], { laps: 1, maxTime: 5, spawnFrac: 0.5 });
+  assert.ok(Number.isFinite(r.endSpeed) && r.endSpeed >= 0, 'endSpeed recorded');
+  assert.ok(r.done === 'crash' || r.done === 'timeout' || r.done === 'lap');
+});
+
+test('curvature CDF built; corner-biased spawns stay in range and deterministic', () => {
+  const idx = makeTrackIndex(oval());
+  assert.ok(idx.curveTotal > 0, 'oval has curvature');
+  assert.equal(idx.curveCum.length, 120);
+  const sorted = [...idx.curveCum];
+  sorted.sort((a, b) => a - b);
+  assert.deepEqual(idx.curveCum, sorted, 'CDF monotonic');
+  const r1 = Array.from({ length: 20 }, () => sampleSpawnFrac(idx, mulberry32(4)));
+  const r2 = Array.from({ length: 20 }, () => sampleSpawnFrac(idx, mulberry32(4)));
+  assert.deepEqual(r1, r2, 'deterministic per seed');
+  assert.ok(r1.every((f) => f >= 0 && f < 1), 'fractions in [0,1)');
+});
+
+test('spawnAt sets rolling velocity along the tangent; coasting covers ground', async () => {
+  const idx = makeTrackIndex(oval());
+  const s = spawnAt(idx, 0.1, 150);
+  assert.equal(Math.round(Math.hypot(s.car.vx, s.car.vy)), 150);
+  // parked policy coasts from speed before stalling: progress without throttle
+  const r = await runEpisode(idx, phys, () => [0, 0, 0], { laps: 1, maxTime: 3, spawnFrac: 0.1, spawnSpeed: 150 });
+  assert.ok(r.progress > 0.005, `coasted prog=${r.progress}`);
+  assert.equal(r.done, 'timeout');
+});
+
+test('hairpin track (R=30, tighter than Bahrain) is kinematically lappable', async () => {
+  // Regression: WHEELBASE=32 needed 95px+ to turn, making real hairpins
+  // impassable for any policy. Pursuit must complete a lap.
+  const pts: [number, number][] = [];
+  for (let x = 0; x <= 300; x += 10) pts.push([x, 0]);
+  for (let a = -90; a <= 90; a += 6) {
+    const t = (a * Math.PI) / 180;
+    pts.push([300 + 30 * Math.cos(t), 30 + 30 * Math.sin(t)]);
+  }
+  for (let x = 300; x >= 0; x -= 10) pts.push([x, 60]);
+  for (let a = 90; a <= 270; a += 6) {
+    const t = (a * Math.PI) / 180;
+    pts.push([30 * Math.cos(t), 30 + 30 * Math.sin(t)]);
+  }
+  const t: Track = { id: 'h', name: 'hairpin', centerline: pts, width: 40, startS: 0, closed: true, gates: [] };
+  const idx = makeTrackIndex(t);
+  const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
+  const r = await runEpisode(idx, phys, (_obs, car) => {
+    const loc = locate(idx, car.x, car.y, -1);
+    const tp = pointAt(idx.track.centerline, true, loc.frac + 0.015);
+    const err = wrap(Math.atan2(tp[1] - car.y, tp[0] - car.x) - car.heading);
+    const steer = Math.max(-1, Math.min(1, err * 3));
+    const v = Math.hypot(car.vx, car.vy);
+    return [v < 120 ? 1 : 0, v > 120 ? 0.8 : 0, steer];
+  }, { laps: 1, maxTime: 60 });
+  assert.equal(r.done, 'lap');
 });
