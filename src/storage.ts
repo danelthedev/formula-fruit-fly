@@ -17,6 +17,7 @@ const DB = 'racing-sim', STORE = 'kv', K = {
   teams: 'rs.v1.teams',
   racecfg: 'rs.v1.racecfg',
   racesession: 'rs.v1.racesession',
+  champ: 'rs.v1.champ',
   migrated: 'rs.v1.migrated',
 };
 
@@ -163,6 +164,12 @@ export const loadRaceSession = async (): Promise<RaceSession | null> => {
 };
 export const saveRaceSession = async (s: RaceSession | null): Promise<void> => {
   await kvSet(K.racesession, s ? JSON.stringify(s) : null).catch(() => {});
+};
+
+// Championship: validated in main.ts (sanitizeChamp), stored raw here.
+export const loadChamp = async (): Promise<unknown> => parse(await kvGet(K.champ));
+export const saveChamp = async (c: unknown): Promise<void> => {
+  await kvSet(K.champ, c ? JSON.stringify(c) : null).catch(() => {});
 };
 
 // ---- driver weights: best net + final-epoch population per team ----

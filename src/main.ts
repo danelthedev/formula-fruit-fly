@@ -1,14 +1,15 @@
 import { buildMask, extractCore, largestComponent, prune, simplifySkeleton, thin, traceLoop } from './skeleton.ts';
 import { blendSeam, checkpoints, closeLoop, dist, distToTrack, edges, gateAt, nearestIndex, pointAt, projectFraction, resample, ribbon, ribbonSelfOverlap, sampleArc, sampleLine, sanitizePoints, sanitizeTrack, seamPatch, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, uid, validateGeometry, vertexWidths, widthAt } from './track.ts';
 import type { Pt, Track } from './track.ts';
-import { deleteTrack, deleteWeights, listTracks, loadBg, loadDraft, loadPieces, loadPopulation, loadRaceCfg, loadRaceSession, loadTeams, loadView, loadWeights, ready as storeReady, saveBg, saveDraft, savePieces, savePopulation, saveRaceCfg, saveRaceSession, saveTeams, saveTrack, saveView, saveWeights } from './storage.ts';
+import { deleteTrack, deleteWeights, listTracks, loadBg, loadChamp, loadDraft, loadPieces, loadPopulation, loadRaceCfg, loadRaceSession, loadTeams, loadView, loadWeights, ready as storeReady, saveBg, saveChamp, saveDraft, savePieces, savePopulation, saveRaceCfg, saveRaceSession, saveTeams, saveTrack, saveView, saveWeights } from './storage.ts';
+import type { QualiSaved } from './storage.ts';
 import { adaptSigma, epochTimeout, initPop, migrateIslands, restartPop, runEpoch } from './ga.ts';
 import { buildNet, decodeWeightsFile, encodeWeightsFile, forwardGenome, mutateGenome, randomGenome, withBrakeBias } from './nn.ts';
 import type { EpochResult, GAConfig } from './ga.ts';
 import type { GenomeNet } from './nn.ts';
 import { locate, makeTrackIndex, mulberry32, observe, spawn, stepCar, DT } from './sim.ts';
 import type { CarState, TrackIndex } from './sim.ts';
-import { buildRoster, drawRaceScene, sanitizeSetup, sortQuali, validateSetup } from './race.ts';
+import { buildRoster, drawRaceScene, driverName, sanitizeSetup, sortQuali, validateChamp, validateSetup } from './race.ts';
 import type { Driver, QualiEntry, RaceConfig, SceneCar } from './race.ts';
 import { blankTeam, drawCarPreview, physicsFor, sanitizeTeam, teamErrors } from './teams.ts';
 import type { PhysicsParams, Team } from './teams.ts';
@@ -26,6 +27,19 @@ function gid(id: string): HTMLElement {
   if (!e) throw new Error('missing #' + id);
   return e;
 }
+
+// ponytail: fades only on non-end sides of containers that actually overflow.
+function paintFades() {
+  document.querySelectorAll<HTMLElement>('.board, #team-list, #checks, #panel, #race-teams, #champ-tracks, #champ-teams, #champ-races, #race-setup .setup-card').forEach((el) => {
+    const can = el.scrollHeight > el.clientHeight + 1;
+    el.style.setProperty('--fade-t', can && el.scrollTop > 4 ? 'transparent' : '#000');
+    el.style.setProperty('--fade-b', can && el.scrollTop + el.clientHeight < el.scrollHeight - 4 ? 'transparent' : '#000');
+  });
+}
+let fadeT = 0;
+const queueFades = () => { window.clearTimeout(fadeT); fadeT = window.setTimeout(paintFades, 60); };
+window.addEventListener('scroll', queueFades, true);
+new MutationObserver(queueFades).observe(document.getElementById('app')!, { childList: true, subtree: true });
 
 const SNAP = 40;    // endpoint magnet radius, screen px (divided by zoom at use)
 const ERASE_R = 24; // eraser radius, screen px
@@ -665,7 +679,7 @@ function render() {
     pieces.forEach((pc, i) => {
       const b = buildFromPiece(pc);
       if (!b || b.center.length < 2) return;
-      ctx.strokeStyle = i === active ? '#0af' : '#1f7aa8';
+      ctx.strokeStyle = i === active ? '#ffb300' : '#6b5f33';
       ctx.lineWidth = 2;
       pathOf(b.center, b.closed && b.center.length >= 8);
       ctx.stroke();
@@ -876,15 +890,23 @@ gid('nav-races').onclick = () => showView('races');
 
 // ---- single-race setup (Story 3-4, subtask 4) ----
 let raceCfg: RaceConfig | null = null; // locked selections (persisted)
-type RacePane = 'landing' | 'setup' | 'practice' | 'quali' | 'race' | 'champ';
+type RacePane = 'landing' | 'setup' | 'practice' | 'quali' | 'race' | 'champ' | 'champsetup';
 let racePane: RacePane = 'landing';
 function setRacePane(p: RacePane) {
   racePane = p;
-  (Object.entries({ 'race-landing': 'landing', 'race-setup': 'setup', 'race-practice': 'practice', 'race-quali': 'quali', 'race-race': 'race', 'race-champ': 'champ' }) as [string, RacePane][])
+  (Object.entries({ 'race-landing': 'landing', 'race-setup': 'setup', 'race-champsetup': 'champsetup', 'race-practice': 'practice', 'race-quali': 'quali', 'race-race': 'race', 'race-champ': 'champ' }) as [string, RacePane][])
     .forEach(([id, vv]) => (gid(id) as HTMLElement).hidden = vv !== p);
   if (p === 'quali') { fitSessionCanvas(gid('quali-canvas') as HTMLCanvasElement); if (qualiIdx && !quali?.running) drawQualiScene([]); }
   if (p === 'race') { fitSessionCanvas(gid('race-canvas') as HTMLCanvasElement); if (raceIdx && !raceRunning) drawRaceSceneOnCanvas(); }
   if (p === 'practice') { fitSessionCanvas(gid('practice-canvas') as HTMLCanvasElement); if (practiceIdx && !previewRunning && session) drawPracticeScene(); }
+}
+// ponytail: track ribbon preview reuses the session renderer, no new drawing code.
+function paintTrackPreview(canvasId: string, t: Track | undefined) {
+  const cv = gid(canvasId) as HTMLCanvasElement;
+  const ctx = cv.getContext('2d')!;
+  if (!t) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, cv.width, cv.height); return; }
+  const idx = makeTrackIndex(t);
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track));
 }
 async function renderRaces() {
   setRacePane(racePane);
@@ -920,15 +942,18 @@ async function renderRaces() {
     const lab = document.createElement('label');
     lab.append(cb, sw, nm);
     const exp = document.createElement('button');
-    exp.textContent = 'Export';
+    exp.className = 'mini';
+    exp.textContent = '↓';
     exp.title = 'Download this team\u2019s saved weights';
     exp.onclick = () => { void exportTeamWeights(t.id); };
     const imp = document.createElement('button');
-    imp.textContent = 'Import';
+    imp.className = 'mini';
+    imp.textContent = '↑';
     imp.title = 'Load a weights file as this team\u2019s saved best';
     imp.onclick = () => { weightsImportTarget = t.id; gid('file-weights').click(); };
     const clr = document.createElement('button');
-    clr.textContent = 'Clear';
+    clr.className = 'mini';
+    clr.textContent = '✕';
     clr.title = 'Forget this team\u2019s saved weights (retrain from scratch)';
     clr.onclick = () => { void clearTeamWeights(t.id); };
     row.append(lab, exp, imp, clr);
@@ -937,9 +962,13 @@ async function renderRaces() {
   (gid('in-race-drivers') as HTMLInputElement).value = String(raceCfg?.drivers ?? 2);
   (gid('in-race-laps') as HTMLInputElement).value = String(raceCfg?.laps ?? 3);
   gid('race-setup-hint').textContent = '';
-  (gid('sel-race-track') as HTMLSelectElement).onchange = () => { void updateSkipButton(); };
+  (gid('sel-race-track') as HTMLSelectElement).onchange = () => { paintTrackPreview('setup-track-preview', tracks.find((t) => t.id === (gid('sel-race-track') as HTMLSelectElement).value)); void updateSkipButton(); };
   gid('race-teams').onchange = () => { void updateSkipButton(); };
+  paintTrackPreview('setup-track-preview', tracks.find((t) => t.id === (gid('sel-race-track') as HTMLSelectElement).value));
   void updateSkipButton();
+  const tCard = gid('sel-race-track').closest('section') as HTMLElement | null;
+  const eCard = gid('race-teams').closest('section') as HTMLElement | null;
+  if (tCard && eCard) eCard.style.maxHeight = `${tCard.offsetHeight}px`; // teams card never taller than track card
 }
 
 // Skip-to-qualifying: enabled when every checked team has saved weights.
@@ -1135,17 +1164,10 @@ function updatePracticeCards() {
         continue;
       }
       if (st.status === 'training' && !st.finalize && st.epoch >= ses.exploreN) {
-        if ((st.bestFit ?? -Infinity) < 900 && ses.extended < 3) {
-          // no lap yet (laps score 1300+ everywhere): finalizing now would freeze
-          // around a non-lapper. Extend explore instead; the counter follows.
-          ses.exploreN += 10; ses.total += 10; ses.extended++;
-          say(`${teams.find((t) => t.id === st.teamId)?.name ?? 'Team'} hasn't lapped yet — exploring 10 more epochs first.`);
-        } else {
-          st.finalize = true;
-          for (const isl of st.islands) { isl.stasis = 0; isl.sigma = 0.01; }
-          const team = teams.find((t) => t.id === st.teamId);
-          say(`${team?.name ?? 'Team'} reached epoch ${ses.exploreN} — finalizing: σ frozen, worst-episode selection.`);
-        }
+        st.finalize = true;
+        for (const isl of st.islands) { isl.stasis = 0; isl.sigma = 0.01; }
+        const team = teams.find((t) => t.id === st.teamId);
+        say(`${team?.name ?? 'Team'} reached epoch ${ses.exploreN} — finalizing: σ frozen, worst-episode selection.`);
       }
     }
     if (practiceTeams.length && practiceTeams.every((s) => s.epoch >= ses.total)) finishSession();
@@ -1165,7 +1187,7 @@ function updatePracticeCards() {
 }
 
 // ---- programmed practice session: explore N epochs, auto-finalize, done → quali ----
-interface Session { exploreN: number; total: number; done: boolean; extended: number }
+interface Session { exploreN: number; total: number; done: boolean }
 let session: Session | null = null; // null outside a programmed session (e.g. before Begin)
 
 function sessionCfg(): { exploreN: number; finalizeN: number } {
@@ -1174,7 +1196,7 @@ function sessionCfg(): { exploreN: number; finalizeN: number } {
     return Number.isFinite(v) ? v : dflt;
   };
   return {
-    exploreN: Math.min(500, Math.max(10, Math.round(num('in-ga-explore', 80)))),
+    exploreN: Math.min(500, Math.max(1, Math.round(num('in-ga-explore', 80)))),
     finalizeN: Math.min(200, Math.max(0, Math.round(num('in-ga-finalize', 30)))),
   };
 }
@@ -1183,7 +1205,7 @@ function sessionCfg(): { exploreN: number; finalizeN: number } {
 // finalize per team at exploreN; Start Quali unlocks when all teams finish.
 function beginSession() {
   const { exploreN, finalizeN } = sessionCfg();
-  session = { exploreN, total: exploreN + finalizeN, done: false, extended: 0 };
+  session = { exploreN, total: exploreN + finalizeN, done: false };
   previewedAt = -1;
   for (const st of practiceTeams) { st.status = 'training'; st.finalize = false; }
   say(`Practice: ${exploreN} explore + ${finalizeN} finalize epochs. Previews every ${raceCfg?.previewEvery ?? 0}.`);
@@ -1598,7 +1620,7 @@ interface QualiRun { roster: Driver[]; entries: QualiEntry[]; idx: number; seed:
 let quali: QualiRun | null = null;
 let qualiIdx: TrackIndex | null = null;
 
-async function enterQuali() {
+async function enterQuali(fixedNames?: string[]) {
   if (!raceCfg) return;
   stopPracticeAll();
   const tracks = await listTracks();
@@ -1622,6 +1644,7 @@ async function enterQuali() {
     && saved.cfg.teamIds.join() === raceCfg.teamIds.join() && saved.cfg.drivers === raceCfg.drivers && saved.cfg.laps === raceCfg.laps;
   const seed = sameCfg ? saved.seed : (Math.random() * 2 ** 31) | 0;
   const roster = buildRoster(raceCfg.teamIds, names, raceCfg.drivers, pops, bests, mulberry32(seed));
+  if (fixedNames?.length === roster.length) roster.forEach((d, i) => (d.name = fixedNames[i])); // champ: stable driver names across races
   quali = { roster, entries: sameCfg ? saved.quali.map((e) => ({ ...e, teamName: names.get(e.teamId) ?? e.teamId })) : [], idx: 0, seed, aborted: false, running: false };
   quali.idx = quali.entries.length; // completed count (finish order, not roster order)
   (gid('btn-start-race') as HTMLButtonElement).disabled = true;
@@ -1649,10 +1672,17 @@ function qualiTimeout(): number {
 interface QualiRunner {
   d: Driver; car: CarState; genome: Float32Array; phys: PhysicsParams;
   color: string; secondary: string;
-  hint: number; prevFrac: number | null; prog: number; time: number; frames: number;
+  hint: number; prevFrac: number | null; prog: number; time: number; frames: number; stallT: number; stallProg: number;
   tZero: number | null; done: boolean;
 }
 let qualiLive: QualiRunner[] = [];
+// ponytail: one stall rule for quali + race — under 1% progress in 3s of drive time = DNF.
+function stalled(c: { prog: number; time: number; stallT: number; stallProg: number }): boolean {
+  if (c.time - c.stallT < 3) return false;
+  if (c.prog - c.stallProg < 0.01) return true;
+  c.stallT = c.time; c.stallProg = c.prog;
+  return false;
+}
 
 async function qualiLoop() {
   if (!quali || !qualiIdx || !practiceNet || quali.running) return;
@@ -1663,11 +1693,11 @@ async function qualiLoop() {
     const lineup = quali.roster.filter((d) => !doneKeys.has(d.teamId + '|' + d.name));
     qualiLive = lineup.map((d) => {
       const team = teams.find((t) => t.id === d.teamId)!;
-      return { d, car: { x: 0, y: 0, heading: 0, vx: 0, vy: 0 }, genome: new Float32Array(d.genome), phys: physicsFor(team), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, time: 0, frames: 0, tZero: null, done: false };
+      return { d, car: { x: 0, y: 0, heading: 0, vx: 0, vy: 0 }, genome: new Float32Array(d.genome), phys: physicsFor(team), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, time: 0, frames: 0, stallT: 0, stallProg: 0, tZero: null, done: false };
     });
     if (qualiLive.length) {
-      const slots = gridSlots(qualiIdx, qualiLive.length);
-      qualiLive.forEach((r, i) => { r.car = { x: slots[i].x, y: slots[i].y, heading: slots[i].heading, vx: 0, vy: 0 }; });
+      const slot = gridSlots(qualiIdx, 1)[0]; // quali: everyone launches from the same spot
+      qualiLive.forEach((r) => { r.car = { x: slot.x, y: slot.y, heading: slot.heading, vx: 0, vy: 0 }; });
       say(`Qualifying — ${qualiLive.length} driver${qualiLive.length === 1 ? '' : 's'} on track together.`);
       await animateQualiAll(timeout);
     }
@@ -1708,6 +1738,7 @@ function animateQualiAll(timeout: number): Promise<void> {
           if (r.tZero == null && r.prog >= 0) r.tZero = r.time;
           if (loc.dist > loc.hw) finish(r, null);
           else if (r.prog >= 1) finish(r, r.time - (r.tZero ?? 0));
+          else if (stalled(r)) finish(r, null);
           else if (r.time >= timeout || ++r.frames > 60 * 120) finish(r, null);
           else { stepCar(r.car, forwardGenome(r.genome, observe(idx, r.car, loc)), r.phys); r.time += DT; }
         }
@@ -1790,12 +1821,11 @@ async function renderLastResults() {
   el.textContent = w.time != null ? `Last race: ${w.name} wins in ${fmtTime(w.time)} (${ordered.length} drivers).` : '';
 }
 
-gid('btn-start-quali').onclick = () => { void enterQuali(); };
-gid('btn-quali-back').onclick = () => { if (quali) quali.aborted = true; setRacePane('practice'); };
+gid('btn-start-quali').onclick = () => { void enterQuali(champRace && champ ? champ.lineup.map((l) => l.name) : undefined); };
 // ---- race session (Story 4, subtask 8) ----
 interface RaceCar {
   teamId: string; teamName: string; name: string; car: CarState; genome: Float32Array; phys: PhysicsParams;
-  color: string; hint: number; prevFrac: number | null; prog: number;
+  color: string; hint: number; prevFrac: number | null; prog: number; stallT: number; stallProg: number;
   time: number;
   done: boolean; dnf: boolean; finishTime: number | null;
   gateKeys: string[]; gateMap: Map<string, number>; nextGate: number | null; // gate-crossing times for gap timing (key = lap:gate, -1 = start line)
@@ -1848,7 +1878,7 @@ async function enterRace() {
       teamId: e.teamId, teamName: e.teamName, name: e.name, phys: physicsFor(team),
       car: { x: slots[i].x, y: slots[i].y, heading: slots[i].heading, vx: 0, vy: 0 },
       genome: new Float32Array(qd.genome), color: team.primary,
-      hint: -1, prevFrac: null, prog: 0, time: 0, gateKeys: [], gateMap: new Map(), nextGate: null,
+      hint: -1, prevFrac: null, prog: 0, time: 0, stallT: 0, stallProg: 0, gateKeys: [], gateMap: new Map(), nextGate: null,
       done: false, dnf: false, finishTime: null,
     };
   });
@@ -1918,6 +1948,7 @@ function raceStep() {
     r.prevFrac = loc.frac;
     if (loc.dist > loc.hw) { r.done = true; r.dnf = true; continue; }
     if (r.prog >= raceLaps) { r.done = true; r.finishTime = r.time; continue; }
+    if (stalled(r)) { r.done = true; r.dnf = true; continue; }
     if (r.time > 60 * 180) { r.done = true; r.dnf = true; continue; }
     stepCar(r.car, forwardGenome(r.genome, observe(raceIdx, r.car, loc)), r.phys);
     r.time += DT;
@@ -1984,12 +2015,25 @@ async function finishRace() {
   if (quali && raceCfg) await saveRaceSession({ stage: 'race', cfg: raceCfg, seed: quali.seed, quali: quali.entries, nextIdx: quali.idx, results });
   renderRaceBoard();
   const w = order[0];
+  if (champRace && champ && raceCfg) {
+    const i = champ.trackIds.indexOf(raceCfg.trackId);
+    if (i >= 0) {
+      champ.results[i] = results;
+      champ.current = Math.max(champ.current, i + 1);
+      champViewRace = i;
+      await saveChamp(champ);
+    }
+    (gid('btn-race-to-champ') as HTMLButtonElement).hidden = false;
+  }
   say(w && !w.dnf ? `${w.name} wins in ${fmtTime(w.finishTime!)}.` : 'Race over — no finishers.');
 }
 
 gid('btn-start-race').onclick = () => { void enterRace(); };
-gid('btn-race-back').onclick = () => { raceAbort = true; raceRunning = false; gid('race-lights').hidden = true; setRacePane('quali'); };
-gid('btn-practice-back').onclick = () => { session = null; stopPracticeAll(); stopAllWorkers(); setRacePane('setup'); void renderRaces(); };
+gid('btn-practice-back').onclick = () => {
+  session = null; stopPracticeAll(); stopAllWorkers();
+  if (champRace && champ) { void renderChampMenu(); return; } // locked settings: no setup to return to
+  setRacePane('setup'); void renderRaces();
+};
 (gid('in-ga-preview') as HTMLInputElement).onchange = async () => {
   if (!raceCfg) return;
   const v = Math.max(0, Math.round(Number((gid('in-ga-preview') as HTMLInputElement).value) || 0));
@@ -2033,9 +2077,248 @@ gid('btn-race-skip').onclick = async () => {
   void enterQuali();
 };
 gid('btn-race-single').onclick = () => { setRacePane('setup'); void renderRaces(); };
-gid('btn-race-champ').onclick = () => setRacePane('champ');
+gid('btn-race-champ').onclick = () => {
+  if (champ) {
+    champViewRace = -1; // land on the next-race preview, nothing pre-selected
+    void renderChampMenu();
+  }
+  else { setRacePane('champsetup'); void renderChampSetup(); }
+};
 gid('btn-race-setup-back').onclick = () => setRacePane('landing');
 gid('btn-race-champ-back').onclick = () => setRacePane('landing');
+gid('btn-champ-setup-back').onclick = () => setRacePane('landing');
+
+// ---- championship (multi-race season, locked practice settings) ----
+interface ChampGA { pop: number; islands: number; sigma: number; explore: number; finalize: number; preview: number }
+interface Championship {
+  trackIds: string[]; teamIds: string[]; drivers: number; laps: number;
+  ga: ChampGA; lineup: { teamId: string; name: string }[];
+  results: QualiSaved[][]; current: number;
+}
+let champ: Championship | null = null;
+let champRace = false; // a champ race is running (practice/quali/race panes)
+let champViewRace = -1; // selected completed race shown in the menu
+const CHAMP_PTS = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1];
+
+// ponytail: persisted champ, unknown ids dropped; needs ≥2 tracks + ≥1 team.
+function sanitizeChamp(o: unknown, tracks: Pick<Track, 'id'>[], teams: Pick<Team, 'id'>[]): Championship | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  const trackIds = Array.isArray(r.trackIds) ? (r.trackIds as unknown[]).filter((id): id is string => typeof id === 'string' && tracks.some((t) => t.id === id)) : [];
+  const teamIds = Array.isArray(r.teamIds) ? (r.teamIds as unknown[]).filter((id): id is string => typeof id === 'string' && teams.some((t) => t.id === id)) : [];
+  const num = (v: unknown, dflt: number, lo: number, hi: number) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; };
+  const g = (r.ga ?? {}) as Record<string, unknown>;
+  const ga: ChampGA = {
+    pop: num(g.pop, 32, 4, 256), islands: num(g.islands, 3, 1, 4),
+    sigma: typeof g.sigma === 'number' && isFinite(g.sigma) ? Math.min(0.5, Math.max(0.005, g.sigma)) : 0.05,
+    explore: num(g.explore, 90, 1, 500), finalize: num(g.finalize, 40, 0, 200), preview: num(g.preview, 10, 0, 50),
+  };
+  const lineup = Array.isArray(r.lineup) ? (r.lineup as unknown[]).filter((e): e is { teamId: string; name: string } =>
+    !!e && typeof e === 'object' && teamIds.includes((e as { teamId: string }).teamId) && typeof (e as { name: string }).name === 'string') : [];
+  const results = Array.isArray(r.results) ? (r.results as unknown[]).map((res) =>
+    Array.isArray(res) ? (res as unknown[]).filter((e): e is QualiSaved =>
+      !!e && typeof e === 'object' && typeof (e as QualiSaved).teamId === 'string' && typeof (e as QualiSaved).name === 'string') : []) : [];
+  if (trackIds.length < 2 || !teamIds.length) return null;
+  const want = teamIds.length * num(r.drivers, 2, 1, 4);
+  if (lineup.length !== want) return null; // stale lineup (drivers/teams changed): restart, don't guess
+  return {
+    trackIds, teamIds, drivers: num(r.drivers, 2, 1, 4), laps: num(r.laps, 3, 1, 10), ga, lineup,
+    results: trackIds.map((_, i) => results[i] ?? []),
+    current: Math.min(trackIds.length, num(r.current, 0, 0, trackIds.length)),
+  };
+}
+
+function champCheckRow(box: HTMLElement, value: string, label: string, color: string | null, checked: boolean) {
+  const row = document.createElement('div');
+  row.className = 'race-teamrow';
+  const lab = document.createElement('label');
+  const cb = document.createElement('input');
+  cb.type = 'checkbox'; cb.value = value; cb.checked = checked;
+  lab.append(cb);
+  if (color) { const sw = document.createElement('span'); sw.className = 'swatch'; sw.style.background = color; lab.append(sw); }
+  const nm = document.createElement('span');
+  nm.textContent = label;
+  lab.append(nm);
+  row.append(lab);
+  box.appendChild(row);
+}
+
+async function renderChampSetup() {
+  setRacePane('champsetup');
+  const tracks = await listTracks();
+  const tb = gid('champ-tracks');
+  tb.innerHTML = '';
+  if (!tracks.length) tb.textContent = '(no tracks — build some first)';
+  const keepTracks = new Set(champ?.trackIds ?? tracks.map((t) => t.id));
+  for (const t of tracks) champCheckRow(tb, t.id, `${t.name} (${t.centerline.length}pts)`, null, keepTracks.has(t.id));
+  const eb = gid('champ-teams');
+  eb.innerHTML = '';
+  if (!teams.length) eb.textContent = '(no teams — configure some first)';
+  const keepTeams = new Set(champ?.teamIds.length ? champ.teamIds : teams.map((t) => t.id));
+  for (const t of teams) champCheckRow(eb, t.id, t.name, t.primary, keepTeams.has(t.id));
+  gid('champ-setup-hint').textContent = '';
+}
+
+gid('btn-champ-begin').onclick = async () => {
+  const tracks = await listTracks();
+  const trackIds = [...gid('champ-tracks').querySelectorAll<HTMLInputElement>('input:checked')].map((cb) => cb.value);
+  const teamIds = [...gid('champ-teams').querySelectorAll<HTMLInputElement>('input:checked')].map((cb) => cb.value);
+  const num = (id: string) => Number((gid(id) as HTMLInputElement).value);
+  const input = { trackIds, teamIds, drivers: num('in-champ-drivers'), laps: num('in-champ-laps') };
+  const errs = validateChamp(input, tracks, teams);
+  if (errs.length) { gid('champ-setup-hint').textContent = errs[0]; say(errs[0]); return; }
+  gid('champ-setup-hint').textContent = '';
+  const rand = mulberry32((Math.random() * 2 ** 31) | 0);
+  const taken = new Set<string>();
+  const lineup: { teamId: string; name: string }[] = [];
+  for (const id of teamIds) for (let d = 0; d < input.drivers; d++) lineup.push({ teamId: id, name: driverName(rand, taken) });
+  champ = {
+    ...input, drivers: Math.round(input.drivers), laps: Math.round(input.laps),
+    ga: {
+      pop: Math.round(num('in-champ-pop')), islands: Math.round(num('in-champ-islands')),
+      sigma: num('in-champ-sigma'), explore: Math.round(num('in-champ-explore')),
+      finalize: Math.round(num('in-champ-finalize')), preview: Math.round(num('in-champ-preview')),
+    },
+    lineup, results: trackIds.map(() => []), current: 0,
+  };
+  champRace = false;
+  await saveChamp(champ);
+  renderChampMenu();
+  setRacePane('champ');
+};
+
+// F1-style points for finishers only (DNF scores nothing).
+function champPoints(c: Championship) {
+  const tp = new Map<string, { name: string; pts: number }>();
+  const dp = new Map<string, { team: string; name: string; pts: number }>();
+  for (const id of c.teamIds) tp.set(id, { name: teams.find((t) => t.id === id)?.name ?? id, pts: 0 });
+  for (const l of c.lineup) dp.set(`${l.teamId}|${l.name}`, { team: tp.get(l.teamId)?.name ?? l.teamId, name: l.name, pts: 0 });
+  for (const res of c.results) {
+    if (!res.length) continue;
+    sortQuali(res.map((e) => ({ teamId: e.teamId, teamName: e.teamName ?? '', name: e.name, time: e.time, progress: e.progress })))
+      .forEach((e, pos) => {
+        if (e.time == null) return;
+        const p = CHAMP_PTS[pos] ?? 0;
+        if (!p) return;
+        const team = teams.find((t) => t.id === e.teamId);
+        const tName = e.teamName || team?.name || e.teamId;
+        tp.set(e.teamId, { name: tName, pts: (tp.get(e.teamId)?.pts ?? 0) + p });
+        const dk = `${e.teamId}|${e.name}`;
+        dp.set(dk, { team: tName, name: e.name, pts: (dp.get(dk)?.pts ?? 0) + p });
+      });
+  }
+  const byPts = (a: { pts: number; name: string }, b: { pts: number; name: string }) => b.pts - a.pts || a.name.localeCompare(b.name);
+  return {
+    teams: [...tp.entries()].map(([id, v]) => ({ id, ...v })).sort(byPts),
+    drivers: [...dp.entries()].map(([id, v]) => ({ id, ...v })).sort(byPts),
+  };
+}
+
+
+async function renderChampMenu() {
+  if (!champ) { setRacePane('landing'); return; }
+  const c = champ;
+  const allTracks = await listTracks(); // one read up front: DOM below updates in a single paint, no flash
+  const tname = (id: string) => allTracks.find((t) => t.id === id)?.name ?? '(deleted track)';
+  setRacePane('champ');
+  const { teams: tpts, drivers: dpts } = champPoints(c);
+  const tb = gid('champ-teams-board');
+  tb.innerHTML = '';
+  tpts.forEach((t, i) => {
+    const team = teams.find((x) => x.id === t.id);
+    boardRow(tb, { pos: `P${i + 1}`, mi: i, color: team?.primary ?? '#888', team: 'TEAM', name: t.name, meta: `${t.pts} pts` });
+  });
+  const db = gid('champ-drivers-board');
+  db.innerHTML = '';
+  dpts.forEach((d, i) => {
+    const team = teams.find((x) => x.id === d.id.split('|')[0]);
+    boardRow(db, { pos: `P${i + 1}`, mi: i, color: team?.primary ?? '#888', team: d.team, name: d.name, meta: `${d.pts} pts` });
+  });
+  (db as HTMLElement).style.height = `${tb.offsetHeight}px`; // drivers: exactly the teams height, scroll inside
+  const rb = gid('champ-races');
+  const nextBtn = gid('btn-champ-next') as HTMLButtonElement;
+  nextBtn.remove(); // detach before clearing: it lives inside a row now
+  rb.innerHTML = '';
+  let nextRow: HTMLElement | null = null;
+  for (let i = 0; i < c.trackIds.length; i++) {
+    const done = c.results[i]?.length > 0;
+    const row = document.createElement('div');
+    row.className = 'race-teamrow' + (i === champViewRace ? ' sel' : '') + (done ? ' done' : i === c.current ? ' live' : '');
+    const nm = document.createElement('span');
+    nm.style.flex = '1';
+    nm.textContent = tname(c.trackIds[i]);
+    const st = document.createElement('span');
+    const kind = done ? 'done' : i === c.current ? 'next' : 'todo';
+    st.className = `st ${kind}`;
+    st.textContent = done ? 'done' : i === c.current ? 'next' : `race ${i + 1}`;
+    row.append(nm);
+    if (!done && i === c.current) nextRow = row; // start button goes here, right side
+    else {
+      row.append(st);
+      if (done) row.onclick = ((idx) => () => { champViewRace = champViewRace === idx ? -1 : idx; void renderChampMenu(); })(i);
+    }
+    rb.appendChild(row);
+  }
+  if (c.current >= c.trackIds.length) {
+    nextBtn.disabled = true; nextBtn.textContent = 'Championship complete';
+    rb.parentElement!.appendChild(nextBtn);
+  } else {
+    nextBtn.disabled = false;
+    nextBtn.textContent = c.results[c.current]?.length ? 'Re-run' : 'Start';
+    (nextRow ?? rb).appendChild(nextBtn);
+  }
+  const view = champViewRace >= 0 && c.results[champViewRace]?.length ? champViewRace : -1;
+  (gid('champ-result-card') as HTMLElement).hidden = view < 0;
+  const res = gid('champ-results');
+  res.innerHTML = '';
+  if (view >= 0) {
+    gid('champ-result-title').textContent = `Result — ${tname(c.trackIds[view])}`;
+    sortQuali(c.results[view].map((e) => ({ teamId: e.teamId, teamName: e.teamName ?? '', name: e.name, time: e.time, progress: e.progress })))
+      .forEach((e, i) => {
+        const team = teams.find((t) => t.id === e.teamId);
+        boardRow(res, {
+          pos: `P${i + 1}`, mi: i, color: team?.primary ?? '#888', team: e.teamName || team?.name || e.teamId, name: e.name,
+          meta: e.time != null ? fmtTime(e.time) : 'DNF', metaBad: e.time == null,
+        });
+      });
+  }
+  (res as HTMLElement).style.height = `${tb.offsetHeight}px`; // results: exactly the teams height, scroll inside
+  const nextT = view < 0 ? allTracks.find((t) => t.id === c.trackIds[c.current]) : undefined;
+  (gid('champ-next-card') as HTMLElement).hidden = !nextT;
+  if (nextT) {
+    gid('champ-next-title').textContent = `Upcoming: ${nextT.name} — Track preview`;
+    paintTrackPreview('champ-next-preview', nextT);
+  }
+}
+
+async function startChampRace() {
+  if (!champ || champ.current >= champ.trackIds.length) return;
+  const c = champ;
+  // locked practice settings: written into the single-race inputs practice reads.
+  (gid('in-ga-pop') as HTMLInputElement).value = String(c.ga.pop);
+  (gid('in-ga-islands') as HTMLInputElement).value = String(c.ga.islands);
+  (gid('in-ga-sigma') as HTMLInputElement).value = String(c.ga.sigma);
+  (gid('in-ga-explore') as HTMLInputElement).value = String(c.ga.explore);
+  (gid('in-ga-finalize') as HTMLInputElement).value = String(c.ga.finalize);
+  (gid('in-ga-preview') as HTMLInputElement).value = String(c.ga.preview);
+  raceCfg = { trackId: c.trackIds[c.current], teamIds: [...c.teamIds], drivers: c.drivers, laps: c.laps, previewEvery: c.ga.preview };
+  await saveRaceCfg(raceCfg);
+  champRace = true;
+  (gid('btn-race-to-champ') as HTMLButtonElement).hidden = true;
+  if (await enterPractice()) setRacePane('practice');
+}
+
+gid('btn-champ-next').onclick = () => { void startChampRace(); };
+gid('btn-champ-cancel').onclick = async () => {
+  if (!champ) return;
+  if (!window.confirm('Cancel the championship? Standings and results are lost.')) return;
+  champ = null;
+  champRace = false;
+  champViewRace = -1;
+  await saveChamp(null);
+  setRacePane('landing');
+};
+gid('btn-race-to-champ').onclick = () => { renderChampMenu(); };
 
 // ---- teams (Story 2: Team Configurer) ----
 let teams: Team[] = [];
@@ -2080,13 +2363,11 @@ function renderTeams() {
   const ed = editingId ? teams.find((t) => t.id === editingId) : null;
   (gid('team-editor') as HTMLElement).hidden = !ed;
   (gid('team-preview-card') as HTMLElement).hidden = !ed;
-  gid('teams-hint').textContent = teams.length ? '' : 'Create at least 1 team to unlock training.';
   if (!ed) return;
   (gid('in-team-name') as HTMLInputElement).value = ed.name;
   (gid('in-team-primary') as HTMLInputElement).value = ed.primary;
   (gid('in-team-secondary') as HTMLInputElement).value = ed.secondary;
   for (const k of SPECS) (gid(`in-spec-${k}`) as HTMLInputElement).value = String(ed[k]);
-  gid('team-form-title').textContent = 'Edit team';
   (gid('btn-team-del') as HTMLButtonElement).disabled = false;
   paintPreview();
 }
@@ -2404,6 +2685,7 @@ async function boot() {
   await refreshList();
   teams = await loadTeams(); renderTeams();
   raceCfg = sanitizeSetup(await loadRaceCfg(), await listTracks(), teams);
+  champ = sanitizeChamp(await loadChamp(), await listTracks(), teams);
   // restore slider state from draft before first rebuild (else width snaps to default)
   const d = await loadDraft();
   if (d?.closed) {

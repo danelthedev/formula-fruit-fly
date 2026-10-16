@@ -25,7 +25,25 @@ export function validateSetup(
     errs.push('Laps must be 1–10.');
   return errs;
 }
+export interface ChampInput { trackIds: string[]; teamIds: string[]; drivers: number; laps: number }
 
+// Championship setup: a set of races (≥2), same field rules as single race.
+export function validateChamp(
+  input: ChampInput,
+  tracks: Pick<Track, 'id'>[],
+  teams: Pick<Team, 'id'>[],
+): string[] {
+  const errs: string[] = [];
+  const knownTracks = input.trackIds.filter((id) => tracks.some((t) => t.id === id));
+  if (knownTracks.length < 2) errs.push('Pick at least two tracks for a championship.');
+  const known = input.teamIds.filter((id) => teams.some((t) => t.id === id));
+  if (!known.length) errs.push('Pick at least one team.');
+  if (!Number.isInteger(input.drivers) || input.drivers < 1 || input.drivers > 4)
+    errs.push('Drivers per team must be 1–4.');
+  if (!Number.isInteger(input.laps) || input.laps < 1 || input.laps > 10)
+    errs.push('Laps must be 1–10.');
+  return errs;
+}
 // Coerce persisted/UI input into a valid config (unknown ids dropped).
 export function sanitizeSetup(o: unknown, tracks: Pick<Track, 'id'>[], teams: Pick<Team, 'id'>[]): RaceConfig | null {
   if (!o || typeof o !== 'object') return null;

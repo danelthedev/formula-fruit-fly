@@ -44,11 +44,9 @@
           <div class="row">
             <button id="btn-start">Set start</button>
             <button id="btn-tool-gate">Checkpoint</button>
+            <button id="btn-reverse" title="Flip the racing direction (start line and checkpoints ride along)">⇄ Reverse</button>
           </div>
-          <div class="row">
-            <span class="hint">Direction: <strong id="track-direction">—</strong></span>
-            <button id="btn-reverse" title="Flip the racing direction (start line and checkpoints ride along)">Reverse direction</button>
-          </div>
+          <span class="hint">Direction: <strong id="track-direction">—</strong></span>
           <div id="gate-editor" hidden>
             <h2 id="gate-title">Checkpoint</h2>
             <label>Gate width <input id="in-gate-width" type="range" min="20" max="160" value="60" /> <span id="gate-width-val">60</span></label>
@@ -95,35 +93,35 @@
     <section id="view-teams" hidden>
       <div class="teams-wrap">
         <div class="teams-col">
-        <section>
-          <h2>Teams</h2>
+        <section class="setup-card">
+          <h3>Teams</h3>
           <ul id="team-list"></ul>
-          <div class="row">
-            <button id="btn-team-new">New team</button>
-          </div>
-          <div class="row">
-            <button id="btn-teams-export">Export JSON</button>
-            <button id="btn-teams-import">Import JSON</button>
+          <div class="row team-actions">
+            <button id="btn-team-new" class="primary-btn">New team</button>
+            <button id="btn-teams-export" title="Download all teams as JSON">Export</button>
+            <button id="btn-teams-import" title="Load teams from a JSON file">Import</button>
             <input id="file-teams" type="file" accept="application/json" hidden />
           </div>
-          <p class="hint" id="teams-hint"></p>
         </section>
-        <section id="team-preview-card" hidden>
-          <h2>Preview</h2>
+        <section id="team-preview-card" class="setup-card" hidden>
+          <h3>Preview</h3>
           <canvas id="team-preview" width="440" height="330"></canvas>
         </section>
         </div>
-        <section id="team-editor" hidden>
-          <h2 id="team-form-title">New team</h2>
-          <label>Name <input id="in-team-name" maxlength="40" placeholder="Team name" /></label>
-          <label>Primary <input id="in-team-primary" type="color" value="#e10600" /></label>
-          <label>Secondary <input id="in-team-secondary" type="color" value="#ffffff" /></label>
-          <label>Top speed <input id="in-spec-topSpeed" type="range" min="1" max="10" value="5" /> <span id="spec-topSpeed-val">5</span></label>
-          <label>Acceleration <input id="in-spec-acceleration" type="range" min="1" max="10" value="5" /> <span id="spec-acceleration-val">5</span></label>
-          <label>Braking <input id="in-spec-brakeEfficiency" type="range" min="1" max="10" value="5" /> <span id="spec-brakeEfficiency-val">5</span></label>
-          <label>Turning <input id="in-spec-turningAbility" type="range" min="1" max="10" value="5" /> <span id="spec-turningAbility-val">5</span></label>
+        <section id="team-editor" class="setup-card" hidden>
+          <label class="field"><span>Name</span><input id="in-team-name" maxlength="40" placeholder="Team name" /></label>
+          <div class="field-row">
+            <label><span>Primary</span><input id="in-team-primary" type="color" value="#e10600" /></label>
+            <label><span>Secondary</span><input id="in-team-secondary" type="color" value="#ffffff" /></label>
+          </div>
+          <div class="spec-grid">
+            <label>Top speed <input id="in-spec-topSpeed" type="range" min="1" max="10" value="5" /> <span id="spec-topSpeed-val">5</span></label>
+            <label>Acceleration <input id="in-spec-acceleration" type="range" min="1" max="10" value="5" /> <span id="spec-acceleration-val">5</span></label>
+            <label>Braking <input id="in-spec-brakeEfficiency" type="range" min="1" max="10" value="5" /> <span id="spec-brakeEfficiency-val">5</span></label>
+            <label>Turning <input id="in-spec-turningAbility" type="range" min="1" max="10" value="5" /> <span id="spec-turningAbility-val">5</span></label>
+          </div>
           <div class="row">
-            <button id="btn-team-save">Save team</button>
+            <button id="btn-team-save" class="primary-btn">Save team</button>
             <button id="btn-team-cancel">Cancel</button>
             <button id="btn-team-del">Delete</button>
           </div>
@@ -132,35 +130,93 @@
     </section>
     <section id="view-races" hidden>
       <div id="race-landing">
-        <h2>Races</h2>
-        <div class="row">
-          <button id="btn-race-single">Single race</button>
-          <button id="btn-race-champ">Championship</button>
+        <div class="race-hero">
+          <div class="race-cards">
+            <button id="btn-race-single" class="race-card">Single race</button>
+            <button id="btn-race-champ" class="race-card ghost">Championship</button>
+          </div>
         </div>
       </div>
       <div id="race-setup" hidden>
-        <h2>Single race setup</h2>
-        <label>Track <select id="sel-race-track"></select></label>
-        <div id="race-teams"></div>
-        <label>Drivers per team <input id="in-race-drivers" type="number" min="1" max="4" value="2" /></label>
-        <label>Laps <input id="in-race-laps" type="number" min="1" max="10" value="3" /></label>
-        <div class="row">
-          <label>Population <input id="in-ga-pop" type="number" min="4" max="256" value="32" /></label>
-          <label>Islands <input id="in-ga-islands" type="number" min="1" max="4" value="3" title="Parallel populations per team; champions migrate between islands" /></label>
-          <label>Mutation σ <input id="in-ga-sigma" type="number" min="0.005" max="0.5" step="0.005" value="0.05" /></label>
+        <div class="setup-head">
+          <div>
+            <h2>Single race setup</h2>
+          </div>
+          <button id="btn-race-setup-back" class="ghost-btn">← Back</button>
         </div>
-        <div class="row">
-          <label>Explore epochs <input id="in-ga-explore" type="number" min="10" max="500" value="90" title="Evolve freely, then auto-switch to finalize" /></label>
-          <label>Finalize epochs <input id="in-ga-finalize" type="number" min="0" max="200" value="40" title="Consolidate around champions: frozen mutation, worst-episode selection" /></label>
-          <label>Preview every <input id="in-ga-preview" type="number" min="0" max="50" value="10" title="Watch a sample of cars drive every N epochs (0 = off)" /> epochs</label>
+        <div class="setup-grid">
+          <section class="setup-card">
+            <h3>Track</h3>
+            <div class="field"><select id="sel-race-track"></select></div>
+            <canvas id="setup-track-preview" width="640" height="360"></canvas>
+          </section>
+          <section class="setup-card">
+            <h3>Teams</h3>
+            <div class="field"><div id="race-teams"></div></div>
+            <div class="field-row">
+              <label><span>Drivers / team</span><input id="in-race-drivers" type="number" min="1" max="4" value="2" /></label>
+              <label><span>Laps</span><input id="in-race-laps" type="number" min="1" max="10" value="3" /></label>
+            </div>
+          </section>
+          <section class="setup-card wide">
+            <h3>Training</h3>
+            <div class="field-row">
+              <label title="Parallel genomes per team"><span>Population</span><input id="in-ga-pop" type="number" min="4" max="256" value="32" /></label>
+              <label title="Parallel populations per team; champions migrate between islands"><span>Islands</span><input id="in-ga-islands" type="number" min="1" max="4" value="3" /></label>
+              <label title="Mutation strength"><span>Mutation σ</span><input id="in-ga-sigma" type="number" min="0.005" max="0.5" step="0.005" value="0.05" /></label>
+            </div>
+            <div class="field-row">
+              <label title="Evolve freely, then auto-switch to finalize"><span>Explore epochs</span><input id="in-ga-explore" type="number" min="1" max="500" value="90" /></label>
+              <label title="Consolidate around champions: frozen mutation, worst-episode selection"><span>Finalize epochs</span><input id="in-ga-finalize" type="number" min="0" max="200" value="40" /></label>
+              <label title="Watch a sample of cars drive every N epochs (0 = off)"><span>Preview / N</span><input id="in-ga-preview" type="number" min="0" max="50" value="10" /></label>
+            </div>
+          </section>
         </div>
-        <div class="row">
-          <button id="btn-race-begin">Begin practice</button>
+        <div class="setup-foot">
+          <button id="btn-race-begin" class="primary-btn">Begin practice</button>
           <button id="btn-race-skip" title="Qualify straight from saved weights, no training. Weights are per-team, not per-track.">Skip to qualifying</button>
-          <button id="btn-race-setup-back">Back</button>
+          <span class="hint" id="race-setup-hint"></span>
         </div>
-        <p class="hint" id="race-setup-hint"></p>
         <input id="file-weights" type="file" accept="application/json" hidden />
+      </div>
+      <div id="race-champsetup" hidden>
+        <div class="setup-head">
+          <div>
+            <h2>Championship setup</h2>
+          </div>
+          <button id="btn-champ-setup-back" class="ghost-btn">← Back</button>
+        </div>
+        <div class="setup-grid">
+          <section class="setup-card">
+            <h3>Races</h3>
+            <div class="field"><span class="flabel">Tracks in order</span><div id="champ-tracks"></div></div>
+          </section>
+          <section class="setup-card">
+            <h3>Event</h3>
+            <div class="field"><span class="flabel">Teams</span><div id="champ-teams"></div></div>
+            <div class="field-row">
+              <label><span>Drivers / team</span><input id="in-champ-drivers" type="number" min="1" max="4" value="2" /></label>
+              <label><span>Laps</span><input id="in-champ-laps" type="number" min="1" max="10" value="3" /></label>
+            </div>
+          </section>
+          <section class="setup-card wide">
+            <h3>Training (locked for the whole championship)</h3>
+            <div class="field-row">
+              <label><span>Population</span><input id="in-champ-pop" type="number" min="4" max="256" value="32" /></label>
+              <label><span>Islands</span><input id="in-champ-islands" type="number" min="1" max="4" value="3" /></label>
+              <label><span>Mutation σ</span><input id="in-champ-sigma" type="number" min="0.005" max="0.5" step="0.005" value="0.05" /></label>
+            </div>
+            <div class="field-row">
+              <label><span>Explore epochs</span><input id="in-champ-explore" type="number" min="1" max="500" value="90" /></label>
+              <label><span>Finalize epochs</span><input id="in-champ-finalize" type="number" min="0" max="200" value="40" /></label>
+              <label><span>Preview / N</span><input id="in-champ-preview" type="number" min="0" max="50" value="10" /></label>
+            </div>
+          </section>
+        </div>
+        <div class="setup-foot">
+          <button id="btn-champ-begin" class="primary-btn">Start championship</button>
+          <span class="hint" id="champ-setup-hint"></span>
+        </div>
       </div>
       <div id="race-practice" hidden>
         <h2 id="practice-title">Practice</h2>
@@ -170,8 +226,8 @@
             <h3>Leaderboard</h3>
             <ul id="practice-board" class="board"></ul>
             <div class="row">
-              <button id="btn-start-quali" disabled>Start Qualifying</button>
-              <button id="btn-practice-back">Back to setup</button>
+              <button id="btn-start-quali" class="primary-btn" disabled>Start Qualifying</button>
+              <button id="btn-practice-back" class="ghost-btn">Back to setup</button>
             </div>
           </aside>
         </div>
@@ -185,8 +241,7 @@
             <h3>Leaderboard</h3>
             <ul id="quali-board" class="board"></ul>
             <div class="row">
-              <button id="btn-start-race" disabled>Start race</button>
-              <button id="btn-quali-back">Back to practice</button>
+              <button id="btn-start-race" class="primary-btn" disabled>Start race</button>
             </div>
           </aside>
         </div>
@@ -200,7 +255,7 @@
             <h3 id="race-lap">Lap 1/1</h3>
             <ul id="race-board" class="board"></ul>
             <div class="row">
-              <button id="btn-race-back">Back to qualifying</button>
+              <button id="btn-race-to-champ" class="primary-btn" hidden>Championship menu</button>
             </div>
           </aside>
         </div>
@@ -209,10 +264,37 @@
         </div>
       </div>
       <div id="race-champ" hidden>
-        <h2>Championship</h2>
-        <p>Page under construction — check back later.</p>
-        <div class="row">
-          <button id="btn-race-champ-back">Back</button>
+        <div class="setup-head">
+          <div>
+            <h2>Championship</h2>
+          </div>
+          <div class="row">
+            <button id="btn-race-champ-back" class="ghost-btn">← Back</button>
+            <button id="btn-champ-cancel" class="ghost-btn danger">Cancel championship</button>
+          </div>
+        </div>
+        <div class="setup-grid">
+          <section class="setup-card">
+            <h3>Team standings</h3>
+            <ul id="champ-teams-board" class="board"></ul>
+          </section>
+          <section class="setup-card">
+            <h3>Driver standings</h3>
+            <ul id="champ-drivers-board" class="board"></ul>
+          </section>
+          <section class="setup-card">
+            <h3>Races</h3>
+            <div id="champ-races"></div>
+            <button id="btn-champ-next" class="primary-btn">Next race</button>
+          </section>
+          <section class="setup-card" id="champ-result-card" hidden>
+            <h3 id="champ-result-title">Result</h3>
+            <ul id="champ-results" class="board"></ul>
+          </section>
+          <div id="champ-next-card" hidden>
+            <h3 id="champ-next-title">Track preview</h3>
+            <canvas id="champ-next-preview" width="640" height="360"></canvas>
+          </div>
         </div>
       </div>
     </section>
