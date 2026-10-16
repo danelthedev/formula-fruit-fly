@@ -54,7 +54,8 @@ input[type=number] { width: 64px; }
 #race-quali, #race-race, #race-practice, #race-champ { max-width: none !important; }
 .session-wrap { display: flex; gap: 12px; align-items: stretch; }
 .session-wrap canvas { flex: 1 1 auto; min-width: 0; height: min(72vh, 760px); min-height: 380px; background: #111; border: 1px solid #444; border-radius: 8px; }
-.session-side { width: 300px; flex: none; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.session-side { width: 300px; flex: none; display: flex; flex-direction: column; gap: 10px; min-height: 0; max-height: max(380px, min(72vh, 760px)); }
+.session-side .board { flex: 1 1 auto; min-height: 0; }
 .session-side h3 { margin: 2px 0 0; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #9ab; }
 .board { list-style: none; margin: 0; padding: 8px; display: flex; flex-direction: column; gap: 6px; background: #161616; border: 1px solid #333; border-radius: 10px; overflow-y: auto; min-height: 120px; }
 .board li { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 8px; background: #22242a; border: 1px solid transparent; font-size: 13px; }

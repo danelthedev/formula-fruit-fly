@@ -1,6 +1,7 @@
 import type { Team } from './teams.ts';
-import type { Pt } from './track.ts';
-import type { Track } from './track.ts';
+import { distToTrack, gateAt, pointAt, widthAt } from './track.ts';
+import type { Pt, Track } from './track.ts';
+import type { TrackIndex } from './sim.ts';
 
 // ---- Single-race setup + session config (Stories 3-4) ----
 export interface RaceConfig {
@@ -110,19 +111,23 @@ export function sortQuali(entries: QualiEntry[]): QualiEntry[] {
     if (a.time != null && b.time != null) return a.time - b.time;
     if (a.time != null) return -1;
     if (b.time != null) return 1;
-    return b.progress - a.progress;
+    // DNFs by furthest track reached (entries store max progress, not net —
+    // spinners sliding back must not drop below shorter runs).
+    return (b.progress ?? -Infinity) - (a.progress ?? -Infinity);
   });
 }
 
 export interface SceneCar { x: number; y: number; heading: number; color: string; dim?: boolean }
 
-// Track scene renderer shared by quali + race: fit bounds + ribbon. Cars are
-// drawn by the caller (liveried sprites live in main.ts).
+// Track scene renderer shared by preview + practice + quali + race: fit bounds +
+// ribbon, then start line + grid boxes (under the cars callers draw after).
+export interface GridMarks { start: { a: Pt; b: Pt } | null; slots: { x: number; y: number; heading: number }[]; box: { l: number; w: number } }
 export function drawRaceScene(
   ctx: CanvasRenderingContext2D, W: number, H: number,
   centerline: [number, number][], left: Pt[], right: Pt[],
   ribbonPoly: Pt[],
   bg?: { img: HTMLImageElement; x: number; y: number; s: number } | null,
+  marks?: GridMarks | null,
 ) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const [x, y] of centerline) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
@@ -145,6 +150,78 @@ export function drawRaceScene(
   path(right, true); ctx.stroke();
   ctx.fillStyle = '#3d3d3d';
   path(ribbonPoly, true); ctx.fill();
+  if (marks?.start) {
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(marks.start.a[0], marks.start.a[1]); ctx.lineTo(marks.start.b[0], marks.start.b[1]); ctx.stroke();
+  }
+  if (marks?.slots.length) {
+    const { l, w } = marks.box;
+    marks.slots.forEach((sl, i) => {
+      ctx.save();
+      ctx.translate(sl.x, sl.y);
+      ctx.rotate(sl.heading);
+      if (i === 0) { ctx.fillStyle = 'rgba(255,255,255,0.28)'; ctx.fillRect(-l / 2, -w / 2, l, w); } // pole shaded
+      ctx.strokeStyle = 'rgba(255,255,255,0.65)'; ctx.lineWidth = 2;
+      ctx.strokeRect(-l / 2, -w / 2, l, w);
+      ctx.restore();
+    });
+  }
   // NOTE: fit transform intentionally left set — callers draw session cars
   // in track space right after; every entry re-resets at the top.
+}
+
+// Real F1 proportions: 5.6m long on a ~12m wide track ≈ 0.5× width; 0.75× keeps
+// liveries readable at game zoom. A 34px car on 23px Monaco was wider than the road.
+export function carSizeFor(trackWidth: number): number {
+  return Math.min(28, Math.max(16, Math.round(trackWidth * 0.75)));
+}
+
+// F1-stagger grid behind the start line: 2 cols, alternate sides, odd slots
+// half a row back (never on the same line). Slots march back along the arc by
+// chord distance, so corners widen the gap instead of chord-cutting boxes into
+// each other. Lives here (not main.ts) so marks always match car placement.
+export function gridSlots(idx: TrackIndex, n: number): { x: number; y: number; heading: number }[] {
+  const t = idx.track, m = idx.n;
+  const si = t.startS == null ? 0 : t.startS % m;
+  const rowPx = Math.max(30, carSizeFor(t.width) + 4); // same-side gap: boxes never overlap
+  const staggerPx = rowPx / 2; // odd slots sit half a row back
+  const out: { x: number; y: number; heading: number }[] = [];
+  const gjPrev: number[] = []; // same-side predecessor arc index (i-2)
+  for (let i = 0; i < n; i++) {
+    const side = i % 2 === 0 ? -1 : 1;
+    const anchor = i < 2 ? si : gjPrev[i - 2];
+    const want = rowPx + (i < 2 && i % 2 ? staggerPx : 0);
+    const ax = t.centerline[anchor][0], ay = t.centerline[anchor][1];
+    let gj = anchor;
+    for (let k = 0; k < m; k++) {
+      gj = (gj - 1 + m) % m;
+      const dx = t.centerline[gj][0] - ax, dy = t.centerline[gj][1] - ay;
+      if (dx * dx + dy * dy >= want * want) break;
+    }
+    gjPrev[i] = gj;
+    const a = t.centerline[gj], b = t.centerline[(gj + 3) % m], c = t.centerline[(gj - 3 + m) % m];
+    const L = Math.hypot(b[0] - c[0], b[1] - c[1]) || 1;
+    const tx = (b[0] - c[0]) / L, ty = (b[1] - c[1]) / L;
+    const hw = widthAt(t, gj / m) / 2;
+    // edge margin fits the car (not a fixed 12px): fixed margins collapse the
+    // stagger to lat 0 on tight tracks, stacking pairs exactly on top of each other
+    const lat = Math.max(0, Math.min(hw * 0.5 + 5, hw - (carSizeFor(t.width) / 2.8 / 2 + 3)));
+    const p = pointAt(t.centerline, t.closed, gj / m);
+    let x = p[0] + -ty * side * lat, y = p[1] + tx * side * lat;
+    if (distToTrack(t.centerline, t.closed, [x, y]) >= hw - 4) { x = p[0]; y = p[1]; } // bend: fall back to center
+    out.push({ x, y, heading: Math.atan2(ty, tx) });
+  }
+  return out;
+}
+
+// Start line + grid boxes for one track index; n = event grid size.
+// Null startS → no marks (user hasn't placed the line yet).
+// Box matches the car footprint (length = car size, 2.8:1 F1 proportions).
+export function startGridMarks(idx: TrackIndex, n: number): GridMarks {
+  const t = idx.track, m = idx.n;
+  const l = carSizeFor(t.width);
+  const box = { l, w: l / 2.8 };
+  if (t.startS == null || m < 8) return { start: null, slots: [], box };
+  const g = gateAt(t, (t.startS % m) / m);
+  return { start: { a: g.a, b: g.b }, slots: gridSlots(idx, Math.max(0, Math.floor(n))), box };
 }

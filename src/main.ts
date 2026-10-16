@@ -9,7 +9,7 @@ import type { EpochResult, GAConfig } from './ga.ts';
 import type { GenomeNet } from './nn.ts';
 import { locate, makeTrackIndex, mulberry32, observe, spawn, stepCar, DT } from './sim.ts';
 import type { CarState, TrackIndex } from './sim.ts';
-import { buildRoster, drawRaceScene, driverName, sanitizeSetup, sortQuali, validateChamp, validateSetup } from './race.ts';
+import { buildRoster, carSizeFor, drawRaceScene, driverName, gridSlots, sanitizeSetup, sortQuali, startGridMarks, validateChamp, validateSetup } from './race.ts';
 import type { Driver, QualiEntry, RaceConfig, SceneCar } from './race.ts';
 import { blankTeam, drawCarPreview, physicsFor, sanitizeTeam, teamErrors } from './teams.ts';
 import type { PhysicsParams, Team } from './teams.ts';
@@ -368,7 +368,6 @@ const pos = (e: PointerEvent): Pt | null => {
   return [((e.clientX - r.left) * kx - view.ox) / view.s, ((e.clientY - r.top) * kx - view.oy) / view.s];
 };
 canvas.addEventListener('pointerdown', (e) => {
-  if (previewRunning) { previewAbort = true; say('Preview stopped — track is yours again.'); return; } // click takes the track back
   if (e.button === 1) { // wheel-click pan (any tool, even start-armed)
     panning = true; panLast = [e.clientX, e.clientY];
     canvas.setPointerCapture(e.pointerId);
@@ -649,7 +648,6 @@ function renderLive() {
 function render() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (previewIdx) { renderPreviewScene(); return; }
   ctx.setTransform(view.s, 0, 0, view.s, view.ox, view.oy);
   if (bg && bg.img.naturalWidth > 0) ctx.drawImage(bg.img, bg.x, bg.y, bg.img.naturalWidth * bg.s, bg.img.naturalHeight * bg.s);
   // pieces: inactive dim, active brighter
@@ -878,8 +876,7 @@ function showView(v: MainView) {
   (gid('view-races') as HTMLElement).hidden = v !== 'races';
   if (v === 'teams') renderTeams();
   if (v === 'races') void renderRaces();
-  else if (!previewActive) resetRaceSession();
-  if (previewRunning && v !== 'tracks') previewAbort = true; // user bailed mid-preview
+  else resetRaceSession();
   (Object.entries({ 'nav-tracks': 'tracks', 'nav-teams': 'teams', 'nav-races': 'races' }) as [string, MainView][])
     .forEach(([id, vv]) => gid(id).classList.toggle('active', vv === v));
   say('');
@@ -901,12 +898,12 @@ function setRacePane(p: RacePane) {
   if (p === 'practice') { fitSessionCanvas(gid('practice-canvas') as HTMLCanvasElement); if (practiceIdx && !previewRunning && session) drawPracticeScene(); }
 }
 // ponytail: track ribbon preview reuses the session renderer, no new drawing code.
-function paintTrackPreview(canvasId: string, t: Track | undefined) {
+function paintTrackPreview(canvasId: string, t: Track | undefined, gridN = 0) {
   const cv = gid(canvasId) as HTMLCanvasElement;
   const ctx = cv.getContext('2d')!;
   if (!t) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, cv.width, cv.height); return; }
   const idx = makeTrackIndex(t);
-  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track));
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), undefined, startGridMarks(idx, gridN));
 }
 async function renderRaces() {
   setRacePane(racePane);
@@ -962,9 +959,15 @@ async function renderRaces() {
   (gid('in-race-drivers') as HTMLInputElement).value = String(raceCfg?.drivers ?? 2);
   (gid('in-race-laps') as HTMLInputElement).value = String(raceCfg?.laps ?? 3);
   gid('race-setup-hint').textContent = '';
-  (gid('sel-race-track') as HTMLSelectElement).onchange = () => { paintTrackPreview('setup-track-preview', tracks.find((t) => t.id === (gid('sel-race-track') as HTMLSelectElement).value)); void updateSkipButton(); };
-  gid('race-teams').onchange = () => { void updateSkipButton(); };
-  paintTrackPreview('setup-track-preview', tracks.find((t) => t.id === (gid('sel-race-track') as HTMLSelectElement).value));
+  const selPaint = () => {
+    const drivers = Math.min(4, Math.max(1, Math.round(Number((gid('in-race-drivers') as HTMLInputElement).value) || 2)));
+    const nTeams = gid('race-teams').querySelectorAll<HTMLInputElement>('input:checked').length;
+    paintTrackPreview('setup-track-preview', tracks.find((t) => t.id === (gid('sel-race-track') as HTMLSelectElement).value), drivers * nTeams);
+  };
+  (gid('sel-race-track') as HTMLSelectElement).onchange = () => { selPaint(); void updateSkipButton(); };
+  gid('race-teams').onchange = () => { selPaint(); void updateSkipButton(); };
+  (gid('in-race-drivers') as HTMLInputElement).onchange = () => { selPaint(); };
+  selPaint();
   void updateSkipButton();
   const tCard = gid('sel-race-track').closest('section') as HTMLElement | null;
   const eCard = gid('race-teams').closest('section') as HTMLElement | null;
@@ -1050,6 +1053,7 @@ interface TeamTrain {
   hof: { genome: Float32Array; fitness: number; epoch: number } | null; // hall of fame: best confirmed champion ever
   migAt: number; // max island epoch at last migration
   finalize: boolean; // consolidate mode: frozen sigma, no crossover/immigrants, worst-episode selection
+  previewedAt: number; // last epoch shown as a practice ghost (per-team previews)
 }
 let practiceTeams: TeamTrain[] = [];
 let practiceNet: GenomeNet | null = null;
@@ -1077,6 +1081,7 @@ function practiceCfg(): GAConfig {
 
 function stopPracticeAll() {
   for (const st of practiceTeams) if (st.status === 'training') st.status = 'stopped';
+  stopPreviewLoop();
   updatePracticeCards();
 }
 
@@ -1093,9 +1098,7 @@ function resetRaceSession() {
   raceRunning = false;
   raceCars = [];
   raceIdx = null;
-  previewCars = [];
-  previewIdx = null;
-  previewHold = false;
+  stopPreviewLoop();
   practiceTeams = [];
   practiceIdx = null;
   void saveRaceSession(null);
@@ -1143,7 +1146,7 @@ async function enterPractice(): Promise<boolean> {
         islands.push({ pop: initPop(net, cfg.popSize, (Math.random() * 2 ** 31) | 0), best: null, bestFit: -Infinity, sigma: null, stasis: 0, seed: (Math.random() * 2 ** 31) | 0, epoch: 0, lastAvg: NaN });
       }
     }
-    practiceTeams.push({ teamId: id, status: best ? 'stopped' : 'idle', pop, epoch: 0, best: best ? best.slice() : null, bestFit: -Infinity, lastAvg: NaN, sigma: null, stasis: 0, islands, hof: null, migAt: 0, finalize: false });
+    practiceTeams.push({ teamId: id, status: best ? 'stopped' : 'idle', pop, epoch: 0, best: best ? best.slice() : null, bestFit: -Infinity, lastAvg: NaN, sigma: null, stasis: 0, islands, hof: null, migAt: 0, finalize: false, previewedAt: -1 });
   }
   (gid('in-ga-preview') as HTMLInputElement).value = String(raceCfg.previewEvery ?? 0);
   beginSession();
@@ -1171,12 +1174,20 @@ function updatePracticeCards() {
       }
     }
     if (practiceTeams.length && practiceTeams.every((s) => s.epoch >= ses.total)) finishSession();
-    // Synced preview: fire once when the SLOWEST team reaches a preview epoch,
-    // so all teams watch one lap together instead of each triggering its own.
+    // Independent per-team preview: each team reaching a preview epoch puts its
+    // current best on track (staggered — others join as they get there).
     const X = raceCfg?.previewEvery ?? 0;
-    if (X > 0 && practiceTeams.length) {
-      const minEp = Math.min(...practiceTeams.map((s) => s.epoch));
-      if (minEp > 0 && minEp % X === 0 && minEp !== previewedAt) { previewedAt = minEp; previewHold = true; }
+    if (X > 0 && practiceIdx && practiceNet && racePane === 'practice') {
+      for (const st of practiceTeams) {
+        if (!st.best || st.epoch <= 0 || st.epoch % X !== 0 || st.previewedAt === st.epoch) continue;
+        st.previewedAt = st.epoch;
+        const team = teams.find((t) => t.id === st.teamId);
+        if (!team) continue;
+        previewCars = previewCars.filter((g) => g.teamId !== st.teamId); // unfinished run replaced
+        const { car } = spawn(practiceIdx);
+        previewCars.push({ teamId: st.teamId, car, genome: st.best.slice(), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, done: false, frames: 0, phys: physicsFor(team) });
+      }
+      if (previewCars.length) ensurePreviewLoop();
     }
   }
   const ep = practiceTeams.length ? Math.max(...practiceTeams.map((s) => s.epoch)) : 0;
@@ -1206,8 +1217,7 @@ function sessionCfg(): { exploreN: number; finalizeN: number } {
 function beginSession() {
   const { exploreN, finalizeN } = sessionCfg();
   session = { exploreN, total: exploreN + finalizeN, done: false };
-  previewedAt = -1;
-  for (const st of practiceTeams) { st.status = 'training'; st.finalize = false; }
+  for (const st of practiceTeams) { st.status = 'training'; st.finalize = false; st.previewedAt = -1; }
   say(`Practice: ${exploreN} explore + ${finalizeN} finalize epochs. Previews every ${raceCfg?.previewEvery ?? 0}.`);
   updatePracticeCards();
   drawPracticeScene();
@@ -1253,21 +1263,25 @@ function trackBg(t: Track | null | undefined, onReady?: () => void): { img: HTML
   if (![b.x, b.y, b.s].every(isFinite) || b.s <= 0) return null;
   return { img: bgCache.img, x: b.x, y: b.y, s: b.s };
 }
+// grid boxes on every session scene: event grid size (0 = start line only)
+function eventGridN(): number {
+  return raceCfg ? raceCfg.drivers * raceCfg.teamIds.length : 0;
+}
 function drawPracticeScene() {
   if (!practiceIdx) return;
   const cv = gid('practice-canvas') as HTMLCanvasElement;
   fitSessionCanvas(cv);
   const ctx = cv.getContext('2d')!;
   const idx = practiceIdx;
-  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (racePane === 'practice' && !previewRunning) drawPracticeScene(); }));
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (racePane === 'practice' && !previewRunning) drawPracticeScene(); }), startGridMarks(idx, eventGridN()));
 }
 
 // Session preview frame: same track, same size, same leaderboard — only the cars move.
 function drawPracticePreview() {
-  const idx = previewIdx!;
+  const idx = practiceIdx!;
   const cv = gid('practice-canvas') as HTMLCanvasElement;
   const ctx = cv.getContext('2d')!;
-  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (previewRunning) drawPracticePreview(); }));
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (previewRunning) drawPracticePreview(); }), startGridMarks(idx, eventGridN()));
   drawSessionCars(ctx, previewCars.map((g) => ({ x: g.car.x, y: g.car.y, heading: g.car.heading, primary: g.color, secondary: g.secondary, dim: g.done })), carSizeFor(idx.track.width));
 }
 
@@ -1277,12 +1291,7 @@ function drawPracticePreview() {
 // training team per round, so auto-previews and pause/resume stay coordinated.
 let schedActive = false;
 const inFlight = new Set<string>(); // teamIds with a dispatched epoch (replaces the old single epochActive flag)
-let previewHold = false;
-let previewRunning = false;
-let previewAbort = false;
-let previewActive = false;
-let previewOnPractice = false; // session preview: ghosts drive on the practice canvas, view never changes
-let previewedAt = -1; // min-epoch last previewed (synced previews: all teams watch together)
+let previewRunning = false; // ghost loop alive (practice canvas shows driving ghosts)
 const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 
 // One module worker per team, created lazily. Null when workers are unavailable
@@ -1329,13 +1338,11 @@ async function scheduler() {
   schedActive = true;
   try {
     for (;;) {
-      if (previewHold) { stopAllWorkers(); await runPreviewCycle(); await sleep(200); continue; }
       const active = practiceTeams.filter((s) => s.status === 'training');
       if (!active.length) return;
       let dispatched = false;
       const key = (t: TeamTrain, i: number) => `${t.teamId}:${i}`;
       for (const st of active) {
-        if (previewHold) break;
         if (st.status !== 'training') continue;
         // migrate champions between islands when settled (no island in flight)
         const maxEp = st.islands.length ? Math.max(...st.islands.map((s) => s.epoch)) : 0;
@@ -1344,7 +1351,6 @@ async function scheduler() {
           st.migAt = maxEp;
         }
         for (let i = 0; i < st.islands.length; i++) {
-          if (previewHold) break;
           if (st.status !== 'training' || inFlight.has(key(st, i))) continue;
           inFlight.add(key(st, i));
           dispatched = true;
@@ -1403,7 +1409,7 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
   updatePracticeCards();
   const key = `${st.teamId}:${islIdx}`;
   const w = getWorker(key);
-  const stop = () => st.status !== 'training' || previewHold;
+  const stop = () => st.status !== 'training';
   let r: EpochResult;
   try {
     const seed = (isl.seed = (isl.seed + 1) >>> 0);
@@ -1413,7 +1419,7 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
   } catch {
     // worker died mid-epoch: drop it, retry once inline (unless the team is gone/stopped)
     if (w) { try { w.terminate(); } catch { /* gone */ } teamWorkers.delete(key); }
-    if (!practiceTeams.some((s) => s.teamId === st.teamId) || (!previewHold && st.status !== 'training')) { updatePracticeCards(); return; }
+    if (!practiceTeams.some((s) => s.teamId === st.teamId) || st.status !== 'training') { updatePracticeCards(); return; }
     const seed2 = (isl.seed = (isl.seed + 1) >>> 0);
     r = await runEpoch(practiceIdx, phys, isl.pop, ecfg, seed2, stop);
   }
@@ -1459,83 +1465,43 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
   updateQualiGate();
 }
 
-// Manual preview: park training, show all current bests together, resume.
-
-interface GhostCar { car: CarState; genome: Float32Array; color: string; secondary: string; hint: number; prevFrac: number | null; prog: number; done: boolean; frames: number; phys: PhysicsParams }
+// Practice ghosts: one driving car per team, refreshed each preview epoch.
+// Training never pauses — teams join the track as they hit their multiples,
+// staggered. A team hitting its next multiple replaces its unfinished run.
+interface GhostCar { teamId: string; car: CarState; genome: Float32Array; color: string; secondary: string; hint: number; prevFrac: number | null; prog: number; done: boolean; frames: number; phys: PhysicsParams }
 let previewCars: GhostCar[] = [];
-let previewIdx: TrackIndex | null = null;
 
-async function runPreviewCycle() {
-  if (previewRunning) return; // single entry: scheduler or manual, never both
-  const ready = practiceTeams.filter((s) => s.best);
-  if (!ready.length || !practiceNet || !practiceIdx) { previewHold = false; return; }
-  previewRunning = true;
-  previewActive = true;
-  previewAbort = false;
-  try {
-    previewIdx = practiceIdx;
-    // Representative sample: every island's champion on track at once (capped).
-    previewCars = [];
-    for (const s of ready) {
-      const team = teams.find((t) => t.id === s.teamId)!;
-      for (const isl of s.islands) {
-        if (!isl.best) continue;
-        const { car } = spawn(previewIdx!);
-        previewCars.push({ car, genome: isl.best.slice(), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, done: false, frames: 0, phys: physicsFor(team) });
-        if (previewCars.length >= 12) break;
-      }
-      if (previewCars.length >= 12) break;
-    }
-    previewOnPractice = session != null && racePane === 'practice';
-    if (!previewOnPractice) {
-      showView('tracks');
-      (document.querySelector('#panel') as HTMLElement).style.visibility = 'hidden'; // full-width track, no layout shift
-    }
-    say(`Previewing ${previewCars.length} cars — every island's champion on track.`);
-    await animateGhostLap();
-  } finally {
-    const onPractice = previewOnPractice;
-    previewRunning = false;
-    previewActive = false;
-    previewHold = false;
-    previewCars = [];
-    previewIdx = null;
-    previewOnPractice = false;
-    if (onPractice) {
-      if (!previewAbort) drawPracticeScene(); // clear the ghosts, back to the static track
-    } else {
-      (document.querySelector('#panel') as HTMLElement).style.visibility = '';
-      if (!previewAbort) { showView('races'); setRacePane('practice'); }
-      render();
-    }
-  }
+function stopPreviewLoop() {
+  previewRunning = false;
+  previewCars = [];
 }
 
-function animateGhostLap(): Promise<void> {
-  return new Promise((resolve) => {
-    const step = () => {
-      if (previewAbort || !previewIdx || !practiceNet) return resolve();
-      let allDone = true;
-      for (const g of previewCars) {
-        if (g.done) continue;
-        allDone = false;
-        const loc = locate(previewIdx, g.car.x, g.car.y, g.hint);
-        g.hint = loc.bi;
-        if (g.prevFrac == null) g.prevFrac = loc.frac;
-        let d = loc.frac - g.prevFrac;
-        if (d > 0.5) d -= 1;
-        else if (d < -0.5) d += 1;
-        g.prog += d;
-        g.prevFrac = loc.frac;
-        if (loc.dist > loc.hw || g.prog >= 1 || ++g.frames > 60 * 75) { g.done = true; continue; }
-        stepCar(g.car, forwardGenome(g.genome, observe(previewIdx, g.car, loc)), g.phys);
-      }
-      if (previewOnPractice) drawPracticePreview(); else render();
-      if (allDone) { setTimeout(resolve, 800); return; }
-      requestAnimationFrame(step);
-    };
-    requestAnimationFrame(step);
-  });
+function ensurePreviewLoop() {
+  if (previewRunning || !practiceIdx) return;
+  previewRunning = true;
+  requestAnimationFrame(previewStep);
+}
+
+function previewStep() {
+  if (!previewRunning || racePane !== 'practice' || !practiceIdx || !practiceNet) { stopPreviewLoop(); return; }
+  const idx = practiceIdx;
+  for (const g of previewCars) {
+    if (g.done) continue;
+    const loc = locate(idx, g.car.x, g.car.y, g.hint);
+    g.hint = loc.bi;
+    if (g.prevFrac == null) g.prevFrac = loc.frac;
+    let d = loc.frac - g.prevFrac;
+    if (d > 0.5) d -= 1;
+    else if (d < -0.5) d += 1;
+    g.prog += d;
+    g.prevFrac = loc.frac;
+    if (loc.dist > loc.hw || g.prog >= 1 || ++g.frames > 60 * 75) { g.done = true; continue; }
+    stepCar(g.car, forwardGenome(g.genome, observe(idx, g.car, loc)), g.phys);
+  }
+  previewCars = previewCars.filter((g) => !g.done);
+  if (!previewCars.length) { previewRunning = false; drawPracticeScene(); return; }
+  drawPracticePreview();
+  requestAnimationFrame(previewStep);
 }
 
 // Liveried session cars: prerendered per team colors, rotated nose-along-heading.
@@ -1571,11 +1537,6 @@ function liveryFor(primary: string, secondary: string): HTMLCanvasElement {
   }
   return cv;
 }
-// Real F1 proportions: 5.6m long on a ~12m wide track ≈ 0.5× width; 0.75× keeps
-// liveries readable at game zoom. A 34px car on 23px Monaco was wider than the road.
-function carSizeFor(trackWidth: number): number {
-  return Math.min(28, Math.max(16, Math.round(trackWidth * 0.75)));
-}
 function drawSessionCars(ctx: CanvasRenderingContext2D, cars: { x: number; y: number; heading: number; primary: string; secondary: string; dim?: boolean }[], size = 24) {
   for (const c of cars) {
     const img = liveryFor(c.primary, c.secondary);
@@ -1590,22 +1551,6 @@ function drawSessionCars(ctx: CanvasRenderingContext2D, cars: { x: number; y: nu
   ctx.globalAlpha = 1;
 }
 
-function renderPreviewScene() {
-  const idx = previewIdx!;
-  const c = idx.track.centerline;
-  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-  for (const [x, y] of c) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
-  const m = 40;
-  const s = Math.min((canvas.width - 2 * m) / Math.max(1, x1 - x0), (canvas.height - 2 * m) / Math.max(1, y1 - y0));
-  ctx.setTransform(s, 0, 0, s, m - x0 * s, m - y0 * s);
-  const { left, right } = edges(idx.track);
-  ctx.strokeStyle = '#999'; ctx.lineWidth = 4;
-  pathOf(left, true); ctx.stroke();
-  pathOf(right, true); ctx.stroke();
-  ctx.fillStyle = '#3d3d3d';
-  pathOf(ribbon(idx.track), true); ctx.fill();
-  drawSessionCars(ctx, previewCars.map((g) => ({ x: g.car.x, y: g.car.y, heading: g.car.heading, primary: g.color, secondary: g.secondary, dim: g.done })), carSizeFor(idx.track.width));
-}
 
 
 function updateQualiGate() {
@@ -1672,15 +1617,31 @@ function qualiTimeout(): number {
 interface QualiRunner {
   d: Driver; car: CarState; genome: Float32Array; phys: PhysicsParams;
   color: string; secondary: string;
-  hint: number; prevFrac: number | null; prog: number; time: number; frames: number; stallT: number; stallProg: number;
+  hint: number; prevFrac: number | null; prog: number; best: number; time: number; frames: number; stallT: number; stallProg: number;
   tZero: number | null; done: boolean;
 }
 let qualiLive: QualiRunner[] = [];
-// ponytail: one stall rule for quali + race — under 1% progress in 3s of drive time = DNF.
+// ponytail: quali stall rule — under 1% progress in 3s of drive time = DNF.
+// (Race uses a speed-based rule below: fair from a standing start.)
 function stalled(c: { prog: number; time: number; stallT: number; stallProg: number }): boolean {
   if (c.time - c.stallT < 3) return false;
   if (c.prog - c.stallProg < 0.01) return true;
   c.stallT = c.time; c.stallProg = c.prog;
+  return false;
+}
+
+// Race stall rule: parked cars DNF. Speed-based over 5s windows (standstill
+// launches read 0; anything rolling survives), plus a 30s progress backstop
+// so wall-grinders going nowhere still get classified.
+function raceStalled(r: { time: number; prog: number; spdT: number; spdAcc: number; prgT: number; prgMark: number }): boolean {
+  if (r.time - r.spdT >= 5) {
+    if (r.spdAcc / Math.max(1e-6, r.time - r.spdT) < 10) return true;
+    r.spdT = r.time; r.spdAcc = 0;
+  }
+  if (r.time - r.prgT >= 30) {
+    if (r.prog - r.prgMark < 0.005) return true;
+    r.prgT = r.time; r.prgMark = r.prog;
+  }
   return false;
 }
 
@@ -1693,11 +1654,15 @@ async function qualiLoop() {
     const lineup = quali.roster.filter((d) => !doneKeys.has(d.teamId + '|' + d.name));
     qualiLive = lineup.map((d) => {
       const team = teams.find((t) => t.id === d.teamId)!;
-      return { d, car: { x: 0, y: 0, heading: 0, vx: 0, vy: 0 }, genome: new Float32Array(d.genome), phys: physicsFor(team), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, time: 0, frames: 0, stallT: 0, stallProg: 0, tZero: null, done: false };
+      return { d, car: { x: 0, y: 0, heading: 0, vx: 0, vy: 0 }, genome: new Float32Array(d.genome), phys: physicsFor(team), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, best: 0, time: 0, frames: 0, stallT: 0, stallProg: 0, tZero: null, done: false };
     });
     if (qualiLive.length) {
       const slot = gridSlots(qualiIdx, 1)[0]; // quali: everyone launches from the same spot
-      qualiLive.forEach((r) => { r.car = { x: slot.x, y: slot.y, heading: slot.heading, vx: 0, vy: 0 }; });
+      // prog rebased: 0 at the start line — the flying lap is timed line-to-line
+      const qm = qualiIdx.n;
+      const qStartFr = qualiIdx.track.startS == null ? 0 : (qualiIdx.track.startS % qm) / qm;
+      const qProg0 = -((((qStartFr - projectFraction(qualiIdx.track.centerline, qualiIdx.track.closed, [slot.x, slot.y])) % 1) + 1) % 1);
+      qualiLive.forEach((r) => { r.car = { x: slot.x, y: slot.y, heading: slot.heading, vx: 0, vy: 0 }; r.prog = qProg0; r.best = qProg0; r.stallT = 0; r.stallProg = qProg0; });
       say(`Qualifying — ${qualiLive.length} driver${qualiLive.length === 1 ? '' : 's'} on track together.`);
       await animateQualiAll(timeout);
     }
@@ -1718,7 +1683,7 @@ function animateQualiAll(timeout: number): Promise<void> {
     const finish = (r: QualiRunner, time: number | null) => {
       r.done = true;
       if (!quali) return;
-      quali.entries.push({ teamId: r.d.teamId, teamName: r.d.teamName, name: r.d.name, time, progress: r.prog });
+      quali.entries.push({ teamId: r.d.teamId, teamName: r.d.teamName, name: r.d.name, time, progress: r.best });
       quali.idx = quali.entries.length;
       saveRaceSession({ stage: 'quali', cfg: raceCfg!, seed: quali.seed, quali: quali.entries, nextIdx: quali.idx }).catch(() => {});
     };
@@ -1734,7 +1699,7 @@ function animateQualiAll(timeout: number): Promise<void> {
           if (r.prevFrac == null) r.prevFrac = loc.frac;
           let df = loc.frac - r.prevFrac;
           if (df > 0.5) df -= 1; else if (df < -0.5) df += 1;
-          r.prog += df; r.prevFrac = loc.frac;
+          r.prog += df; if (r.prog > r.best) r.best = r.prog; r.prevFrac = loc.frac;
           if (r.tZero == null && r.prog >= 0) r.tZero = r.time;
           if (loc.dist > loc.hw) finish(r, null);
           else if (r.prog >= 1) finish(r, r.time - (r.tZero ?? 0));
@@ -1756,7 +1721,7 @@ function drawQualiScene(cars: (SceneCar & { secondary: string })[]) {
   const cv = gid('quali-canvas') as HTMLCanvasElement;
   const idx = qualiIdx!;
   const ctx = cv.getContext('2d')!;
-  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (qualiIdx && !quali?.running) drawQualiScene([]); }));
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (qualiIdx && !quali?.running) drawQualiScene([]); }), startGridMarks(idx, quali?.roster.length ?? eventGridN()));
   drawSessionCars(ctx, cars.map((c) => ({ x: c.x, y: c.y, heading: c.heading, primary: c.color, secondary: c.secondary, dim: c.dim })), carSizeFor(idx.track.width));
 }
 
@@ -1787,21 +1752,34 @@ function renderQualiBoard() {
   ul.innerHTML = '';
   const ranked = sortQuali(quali?.entries ?? []);
   const p1 = ranked.find((e) => e.time != null)?.time;
-  ranked.forEach((e, i) => {
+  // timed laps first, then everyone else purely by % reached — live position
+  // for drivers, furthest point for DNFs. 27% dead beats 20% driving.
+  let pos = 0;
+  const row = (o: Parameters<typeof boardRow>[1], medal: boolean) => boardRow(ul, { ...o, pos: `P${++pos}`, mi: medal ? pos - 1 : -1 });
+  ranked.filter((e) => e.time != null).forEach((e) => {
     const team = teams.find((t) => t.id === e.teamId);
-    const done = e.time != null;
-    boardRow(ul, {
-      pos: `P${i + 1}`, mi: i, color: team?.primary ?? '#888', team: e.teamName, name: e.name,
-      meta: done ? (p1 != null && e.time !== p1 ? `+${(e.time! - p1).toFixed(2)}` : fmtTime(e.time!)) : `DNF · ${(Math.max(0, e.progress) * 100).toFixed(0)}%`,
-      metaBad: !done,
-    });
+    row({
+      pos: '', mi: 0, color: team?.primary ?? '#888', team: e.teamName, name: e.name,
+      meta: p1 != null && e.time !== p1 ? `+${(e.time! - p1).toFixed(2)}` : fmtTime(e.time!),
+    }, true);
   });
-  // everyone still driving, quickest first
-  qualiLive.filter((r) => !r.done).sort((a, b) => b.prog - a.prog).forEach((r) => {
-    boardRow(ul, {
-      pos: '…', mi: -1, color: r.color, team: r.d.teamName, name: r.d.name,
-      meta: `${fmtTime(r.time - (r.tZero ?? 0))} · ${(Math.max(0, r.prog) * 100).toFixed(0)}%`, live: true,
-    });
+  const rest: { sort: number; live?: (typeof qualiLive)[number]; entry?: QualiEntry }[] = [
+    ...qualiLive.filter((r) => !r.done).map((r) => ({ sort: r.prog, live: r })),
+    ...ranked.filter((e) => e.time == null).map((e) => ({ sort: e.progress ?? -Infinity, entry: e })),
+  ].sort((a, b) => b.sort - a.sort);
+  rest.forEach(({ live: r, entry: e }) => {
+    if (r) {
+      row({
+        pos: '', mi: -1, color: r.color, team: r.d.teamName, name: r.d.name,
+        meta: `${fmtTime(r.time - (r.tZero ?? 0))} · ${(Math.max(0, r.prog) * 100).toFixed(0)}%`, live: true,
+      }, false);
+    } else if (e) {
+      const team = teams.find((t) => t.id === e.teamId);
+      row({
+        pos: '', mi: 0, color: team?.primary ?? '#888', team: e.teamName, name: e.name,
+        meta: `DNF · ${(Math.max(0, e.progress ?? 0) * 100).toFixed(0)}%`, metaBad: true,
+      }, false);
+    }
   });
   const qdone = quali?.entries.length ?? 0, qtotal = quali?.roster.length ?? 0;
   gid('btn-start-race').textContent = qtotal && qdone >= qtotal ? 'Start race' : `Start race (${qdone}/${qtotal})`;
@@ -1825,10 +1803,10 @@ gid('btn-start-quali').onclick = () => { void enterQuali(champRace && champ ? ch
 // ---- race session (Story 4, subtask 8) ----
 interface RaceCar {
   teamId: string; teamName: string; name: string; car: CarState; genome: Float32Array; phys: PhysicsParams;
-  color: string; hint: number; prevFrac: number | null; prog: number; stallT: number; stallProg: number;
+  color: string; hint: number; prevFrac: number | null; prog: number; bestProg: number; spdT: number; spdAcc: number; prgT: number; prgMark: number;
   time: number;
   done: boolean; dnf: boolean; finishTime: number | null;
-  gateKeys: string[]; gateMap: Map<string, number>; nextGate: number | null; // gate-crossing times for gap timing (key = lap:gate, -1 = start line)
+  gateMap: Map<string, number>; // start/finish-line crossing times (key = lap:-1) for gap timing
 }
 let raceCars: RaceCar[] = [];
 let raceIdx: TrackIndex | null = null;
@@ -1836,29 +1814,6 @@ let raceRunning = false;
 let raceAbort = false;
 let raceLaps = 3;
 
-// F1-stagger grid behind the start line: 2 cols, alternate sides, row gap.
-export function gridSlots(idx: TrackIndex, n: number): { x: number; y: number; heading: number }[] {
-  const t = idx.track, m = idx.n;
-  const si = t.startS == null ? 0 : t.startS % m;
-  const spacing = idx.total / m;
-  const step = Math.max(1, Math.round(30 / spacing)); // ~30px rows back along the arc
-  const out: { x: number; y: number; heading: number }[] = [];
-  for (let i = 0; i < n; i++) {
-    const row = Math.floor(i / 2), side = i % 2 === 0 ? -1 : 1;
-    const gi = (si - (row + 1) * step) % m;
-    const gj = (gi + m) % m;
-    const a = t.centerline[gj], b = t.centerline[(gj + 3) % m], c = t.centerline[(gj - 3 + m) % m];
-    const L = Math.hypot(b[0] - c[0], b[1] - c[1]) || 1;
-    const tx = (b[0] - c[0]) / L, ty = (b[1] - c[1]) / L;
-    const hw = widthAt(t, gj / m) / 2;
-    const lat = Math.max(0, Math.min(hw * 0.5 + 5, hw - 12));
-    const p = pointAt(t.centerline, t.closed, gj / m);
-    let x = p[0] + -ty * side * lat, y = p[1] + tx * side * lat;
-    if (distToTrack(t.centerline, t.closed, [x, y]) >= hw - 4) { x = p[0]; y = p[1]; } // bend: fall back to center
-    out.push({ x, y, heading: Math.atan2(ty, tx) });
-  }
-  return out;
-}
 
 async function enterRace() {
   if (!raceCfg || !quali || quali.idx < quali.roster.length) return;
@@ -1870,15 +1825,21 @@ async function enterRace() {
   raceLaps = raceCfg.laps;
   const order = sortQuali(quali.entries);
   const slots = gridSlots(raceIdx, order.length);
+  const m = raceIdx.n; // grid-slot arc scale for the prog rebase below
   try {
   raceCars = order.map((e, i) => {
     const team = teams.find((x) => x.id === e.teamId)!;
     const qd = quali!.roster.find((d) => d.name === e.name && d.teamId === e.teamId)!;
+    // prog rebased: 0 at the start line, not the grid — cars finish at the
+    // finish line after raceLaps full laps, and stagger offsets stay fair.
+    const startFr = t.startS == null ? 0 : (t.startS % m) / m;
+    const slotFr = projectFraction(t.centerline, t.closed, [slots[i].x, slots[i].y]);
+    const prog0 = -((((startFr - slotFr) % 1) + 1) % 1);
     return {
       teamId: e.teamId, teamName: e.teamName, name: e.name, phys: physicsFor(team),
       car: { x: slots[i].x, y: slots[i].y, heading: slots[i].heading, vx: 0, vy: 0 },
       genome: new Float32Array(qd.genome), color: team.primary,
-      hint: -1, prevFrac: null, prog: 0, time: 0, stallT: 0, stallProg: 0, gateKeys: [], gateMap: new Map(), nextGate: null,
+      hint: -1, prevFrac: null, prog: prog0, bestProg: prog0, time: 0, spdT: 0, spdAcc: 0, prgT: 0, prgMark: prog0, gateMap: new Map(),
       done: false, dnf: false, finishTime: null,
     };
   });
@@ -1924,34 +1885,22 @@ function raceStep() {
     let df = loc.frac - r.prevFrac;
     if (df > 0.5) df -= 1;
     else if (df < -0.5) df += 1;
-    r.prog += df;
-    // gate + lap crossings for gap timing (r.prevFrac still holds last frame's frac)
+    r.prog += df; if (r.prog > r.bestProg) r.bestProg = r.prog;
+    // start/finish-line crossings feed lap times for gap timing (line-relative
+    // prog: integer crossings ARE line crossings since the grid rebase)
     const lapNow = Math.floor(r.prog);
     if (Math.floor(r.prog - df) < lapNow) {
       const k = `${lapNow}:-1`;
-      if (!r.gateMap.has(k)) { r.gateMap.set(k, r.time); r.gateKeys.push(k); }
-    }
-    const gates = raceIdx.gateOrder;
-    if (gates.length) {
-      if (r.nextGate == null) {
-        const ni = gates.findIndex((g) => g.fr > loc.frac);
-        r.nextGate = ni < 0 ? 0 : ni;
-      }
-      const between = (a: number, b: number, x: number) => a <= b ? (x > a && x <= b) : (x > a || x <= b);
-      let guard = 0;
-      while (guard++ < 2 && r.nextGate != null && between(r.prevFrac ?? loc.frac, loc.frac, gates[r.nextGate].fr)) {
-        const k = `${lapNow}:${r.nextGate}`;
-        if (!r.gateMap.has(k)) { r.gateMap.set(k, r.time); r.gateKeys.push(k); }
-        r.nextGate = (r.nextGate + 1) % gates.length;
-      }
+      if (!r.gateMap.has(k)) r.gateMap.set(k, r.time);
     }
     r.prevFrac = loc.frac;
     if (loc.dist > loc.hw) { r.done = true; r.dnf = true; continue; }
     if (r.prog >= raceLaps) { r.done = true; r.finishTime = r.time; continue; }
-    if (stalled(r)) { r.done = true; r.dnf = true; continue; }
+    if (raceStalled(r)) { r.done = true; r.dnf = true; continue; }
     if (r.time > 60 * 180) { r.done = true; r.dnf = true; continue; }
     stepCar(r.car, forwardGenome(r.genome, observe(raceIdx, r.car, loc)), r.phys);
     r.time += DT;
+    r.spdAcc += Math.hypot(r.car.vx, r.car.vy) * DT;
     } catch { r.done = true; r.dnf = true; }
   }
   try { drawRaceSceneOnCanvas(); renderRaceBoard(); } catch { /* a bad frame must never kill the race */ }
@@ -1963,7 +1912,7 @@ function drawRaceSceneOnCanvas() {
   const cv = gid('race-canvas') as HTMLCanvasElement;
   const idx = raceIdx!;
   const ctx = cv.getContext('2d')!;
-  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (raceIdx && !raceRunning) drawRaceSceneOnCanvas(); }));
+  drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (raceIdx && !raceRunning) drawRaceSceneOnCanvas(); }), startGridMarks(idx, raceCars.length));
   drawSessionCars(ctx, raceCars.map((r) => {
     const team = teams.find((t) => t.id === r.teamId);
     return { x: r.car.x, y: r.car.y, heading: r.car.heading, primary: r.color, secondary: team?.secondary ?? '#ffffff', dim: r.done };
@@ -1971,18 +1920,40 @@ function drawRaceSceneOnCanvas() {
 }
 
 function raceOrder(): RaceCar[] {
-  return raceCars.slice().sort((a, b) => b.prog - a.prog);
+  return raceCars.slice().sort((a, b) => {
+    // finishers by crossing time (frozen prog overshoot is NOT race order —
+    // sorting by prog put the winner mid-pack); the rest purely by % reached,
+    // live position or DNF furthest — same rule as the quali board.
+    if (a.finishTime != null && b.finishTime != null) return a.finishTime - b.finishTime;
+    if (a.finishTime != null) return -1;
+    if (b.finishTime != null) return 1;
+    return (b.dnf ? b.bestProg : b.prog) - (a.dnf ? a.bestProg : a.prog);
+  });
 }
 
-// Gap to the car ahead in seconds, measured at the latest gate (or start line)
-// both have crossed: same piece of tarmac, two timestamps. Null when they share
-// no crossing yet (opening corners).
-function gapToAhead(me: RaceCar, ahead: RaceCar): string | null {
-  for (let i = me.gateKeys.length - 1; i >= 0; i--) {
-    const t = ahead.gateMap.get(me.gateKeys[i]);
-    if (t != null) return `+${(me.gateMap.get(me.gateKeys[i])! - t).toFixed(2)}`;
+// Gap to the car ahead: full laps down shown as +N LAP, otherwise the prog
+// gap scaled by pace (last completed lap, else current-lap partial). Overtakes
+// can't invert it — gate timestamps could, which is why the board went dashed.
+function lastLapTime(r: RaceCar): number | null {
+  for (let L = Math.floor(r.prog); L >= 1; L--) {
+    const t1 = r.gateMap.get(`${L}:-1`), t0 = r.gateMap.get(`${L - 1}:-1`);
+    if (t1 != null && t0 != null && t1 > t0) return t1 - t0;
   }
   return null;
+}
+function partialPace(r: RaceCar): number | null {
+  const t0 = r.gateMap.get('0:-1');
+  if (t0 == null || r.prog <= 0.005) return null;
+  const p = (r.time - t0) / r.prog;
+  return p > 0 ? p : null;
+}
+function gapToAhead(me: RaceCar, ahead: RaceCar): string | null {
+  const dProg = ahead.prog - me.prog;
+  if (Math.floor(dProg) >= 1) return `+${Math.floor(dProg)} LAP`;
+  if (!(dProg > 0)) return null;
+  const pace = lastLapTime(ahead) ?? lastLapTime(me) ?? partialPace(ahead) ?? partialPace(me);
+  if (pace == null) return null;
+  return `+${(dProg * pace).toFixed(2)}`;
 }
 
 function renderRaceBoard() {
@@ -2011,7 +1982,7 @@ function renderRaceBoard() {
 async function finishRace() {
   raceRunning = false;
   const order = raceOrder();
-  const results = order.map((r) => ({ teamId: r.teamId, teamName: teams.find((t) => t.id === r.teamId)?.name ?? r.teamId, name: r.name, time: r.finishTime, progress: r.prog }));
+  const results = order.map((r) => ({ teamId: r.teamId, teamName: teams.find((t) => t.id === r.teamId)?.name ?? r.teamId, name: r.name, time: r.finishTime, progress: r.bestProg }));
   if (quali && raceCfg) await saveRaceSession({ stage: 'race', cfg: raceCfg, seed: quali.seed, quali: quali.entries, nextIdx: quali.idx, results });
   renderRaceBoard();
   const w = order[0];
@@ -2287,7 +2258,7 @@ async function renderChampMenu() {
   (gid('champ-next-card') as HTMLElement).hidden = !nextT;
   if (nextT) {
     gid('champ-next-title').textContent = `Upcoming: ${nextT.name} — Track preview`;
-    paintTrackPreview('champ-next-preview', nextT);
+    paintTrackPreview('champ-next-preview', nextT, c.drivers * c.teamIds.length);
   }
 }
 

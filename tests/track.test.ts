@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildMask, extractCore, largestComponent, thin, prune, simplifySkeleton, traceLoop } from '../src/skeleton.ts';
-import { blendSeam, checkpoints, circleCenter, closeLoop, dist, distToTrack, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, ribbonSelfOverlap, sampleArc, sampleLine, sanitizePoints, sanitizeTrack, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, validateGeometry, vertexWidths, widthAt } from '../src/track.ts';
+import { blendSeam, checkpoints, circleCenter, closeLoop, dist, distToTrack, edges, gateAt, hasSelfIntersection, minSelfSeparation, nearestIndex, pointAt, projectFraction, resample, ribbonSelfOverlap, sampleArc, sampleLine, sanitizePoints, sanitizeTrack, segOverlapsExisting, selfStrokeOverlaps, smooth, smoothOpen, ribbon, validateGeometry, vertexWidths, widthAt } from '../src/track.ts';
 import type { Pt } from '../src/track.ts';
 
 test('resample evens spacing on fixture square', () => {
@@ -423,4 +423,27 @@ test('sanitize drops non-finite points; sanitizeTrack repairs or rejects', () =>
   assert.equal(sanitizeTrack({ ...t, centerline: [[NaN, NaN]] as Pt[] }), null);
   assert.equal(sanitizeTrack(null as unknown as typeof t), null);
   assert.equal(sanitizeTrack({ ...t, gates: undefined as unknown as number[] })!.gates.length, 0);
+});
+
+test('ribbon covers the closing segment on closed tracks (no black slice at seam)', () => {
+  const oval: Pt[] = Array.from({ length: 64 }, (_, i) => {
+    const a = (i / 64) * Math.PI * 2;
+    return [Math.cos(a) * 200, Math.sin(a) * 120] as Pt;
+  });
+  const t = { id: 'x', name: 'x', centerline: oval, width: 60, startS: null, closed: true, gates: [] as number[] };
+  const poly = ribbon(t);
+  const inside = (p: Pt): boolean => {
+    let c = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+      if ((yi > p[1]) !== (yj > p[1]) && p[0] < ((xj - xi) * (p[1] - yi)) / (yj - yi) + xi) c = !c;
+    }
+    return c;
+  };
+  let misses = 0;
+  for (let i = 0; i < oval.length; i++) {
+    const a = oval[i], b = oval[(i + 1) % oval.length];
+    if (!inside([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2])) misses++;
+  }
+  assert.equal(misses, 0, `${misses} road segments outside the ribbon fill`);
 });

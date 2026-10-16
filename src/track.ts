@@ -430,10 +430,14 @@ export function edges(t: Track): { left: Pt[]; right: Pt[] } {
   return { left: sm(left), right: sm(right) };
 }
 
-// Ribbon polygon (left edge forward + right edge back) for fill
+// Ribbon polygon (left edge forward + right edge back) for fill.
+// Closed: routed via L0/R0 so the closing segment (n-1 → 0) stays inside the
+// fill — without it one ~8px road slice at the seam renders as background.
 export function ribbon(t: Track): Pt[] {
   const { left, right } = edges(t);
-  return [...left, ...right.reverse()];
+  const rev = right.slice().reverse();
+  if (t.closed && left.length >= 2) return [...left, left[0], right[0], ...rev];
+  return [...left, ...rev];
 }
 
 // Seam band-aid: small overlap strip around the closure joint, filled over the
