@@ -119,6 +119,27 @@ export function sortQuali(entries: QualiEntry[]): QualiEntry[] {
 
 export interface SceneCar { x: number; y: number; heading: number; color: string; dim?: boolean }
 
+// One racing-line sample: position + pedal inputs that frame.
+export interface TrailPt { x: number; y: number; th: number; br: number }
+
+// Driving-line paint, continuous in both pedals: gray coasting, blending to
+// green with throttle and red with brake (both = muddy mix, as driven).
+// Intensities quantize to 1/8 steps so neighboring samples batch into one path.
+const LINE_GRAY: [number, number, number] = [154, 154, 154];
+const LINE_GREEN: [number, number, number] = [43, 255, 125];
+const LINE_RED: [number, number, number] = [255, 59, 48];
+export function lineColor(throttle: number, brake: number): string {
+  const clamp = (v: number) => Math.min(1, Math.max(0, v));
+  // gamma <1: feathered inputs read as their color, not murk (endpoints exact)
+  const g = (v: number) => Math.round(Math.pow(clamp(v), 0.65) * 8) / 8;
+  const t = g(throttle), b = g(brake);
+  const hex = [0, 1, 2].map((i) => {
+    const v = Math.max(0, Math.min(255, Math.round(LINE_GRAY[i] + t * (LINE_GREEN[i] - LINE_GRAY[i]) + b * (LINE_RED[i] - LINE_GRAY[i]))));
+    return v.toString(16).padStart(2, '0');
+  });
+  return `#${hex.join('')}`;
+}
+
 // Track scene renderer shared by preview + practice + quali + race: fit bounds +
 // ribbon, then start line + grid boxes (under the cars callers draw after).
 export interface GridMarks { start: { a: Pt; b: Pt } | null; slots: { x: number; y: number; heading: number }[]; box: { l: number; w: number } }

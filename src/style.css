@@ -61,6 +61,9 @@ input[type=number] { width: 64px; }
 .board li { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 8px; background: #22242a; border: 1px solid transparent; font-size: 13px; }
 .board li.live { animation: boardpulse 1.2s ease-in-out infinite; }
 .board li.dim { opacity: 0.55; }
+.board li.clickable { cursor: pointer; }
+.board li.clickable:hover { border-color: #777; }
+.board li.sel { border-color: #ffb300; background: #2b2d33; }
 #race-lights { display: flex; gap: 12px; justify-content: center; margin: 12px 0 0; }
 #race-lights[hidden] { display: none; }
 #race-lights .light { width: 36px; height: 36px; border-radius: 50%; background: #330d0d; border: 2px solid #000; }

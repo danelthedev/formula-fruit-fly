@@ -100,6 +100,14 @@ export function aggregateEpisodes(fits: number[], robust: boolean): number {
   if (!fits.length) return -Infinity;
   return robust ? Math.min(...fits) : fits.reduce((a, f) => a + f, 0) / fits.length;
 }
+
+// Corner-approach speed, drawn per episode (shared across genomes, so scores
+// stay comparable): rolling pace keeps easy gradient, near-top-speed arrivals
+// are brake-or-crash selectors. A fixed rolling spawn meant lift-and-coast
+// always sufficed, so evolution deleted the brake pedal entirely.
+export function cornerSpawnSpeed(vMax: number, rand: () => number): number {
+  return vMax * (0.35 + rand() * 0.6);
+}
 export async function runEpoch(
   idx: TrackIndex,
   phys: PhysicsParams,
@@ -110,12 +118,12 @@ export async function runEpoch(
 ): Promise<EpochResult> {
   const stopped = () => shouldStop?.() ?? false;
   const scored: { g: Float32Array; f: number }[] = [];
-  // Shared spawn plan per epoch: episode 0 launches from the start line, the
-  // rest start at the same corner-biased spots for every genome — comparable
-  // scores, corners practiced (where learning happens), no spawn dependence.
-  // Corner spawns lead back ~1.5s of travel at spawn speed: the car approaches
-  // the corner instead of materializing inside it (unrecoverable = pure noise).
   const rand = mulberry32(seed);
+  // Shared spawn plan per epoch: episode 0 launches from the start line, the
+  // rest start at the same corner-biased spots (and arrival speeds) for every
+  // genome — comparable scores, corners practiced (where learning happens).
+  // Corner spawns lead back ~1.5s of travel: the car approaches the corner
+  // instead of materializing inside it (unrecoverable = pure noise).
   const leadFrac = (phys.vMax * 0.75 * 1.5) / idx.total;
   const spawnFracs = Array.from({ length: cfg.episodes }, (_, e) => {
     if (e === 0) return null;
@@ -124,13 +132,14 @@ export async function runEpoch(
       : sampleSpawnFrac(idx, rand);
     return (((fr - leadFrac) % 1) + 1) % 1;
   }) as (number | null)[];
+  const spawnSpeeds = spawnFracs.map((fr) => (fr == null ? 0 : cornerSpawnSpeed(phys.vMax, rand)));
   for (let i = 0; i < pop.length; i++) {
     if (stopped()) break;
     const g = pop[i];
     const fits: number[] = [];
     for (let e = 0; e < cfg.episodes; e++) {
       const policy = (obs: number[]): Control => forwardGenome(g, obs);
-      fits.push(fitnessOf(await runEpisode(idx, phys, policy, { laps: cfg.laps, maxTime: cfg.timeout, spawnFrac: spawnFracs[e], spawnSpeed: spawnFracs[e] == null ? 0 : phys.vMax * 0.35 })));
+      fits.push(fitnessOf(await runEpisode(idx, phys, policy, { laps: cfg.laps, maxTime: cfg.timeout, spawnFrac: spawnFracs[e], spawnSpeed: spawnSpeeds[e] })));
     }
     scored.push({ g: pop[i], f: aggregateEpisodes(fits, cfg.robust) });
     if (i % 8 === 7) await tick();

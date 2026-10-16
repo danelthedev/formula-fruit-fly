@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildRoster, gridSlots, sanitizeSetup, sortQuali, startGridMarks, validateSetup } from '../src/race.ts';
+import { buildRoster, gridSlots, lineColor, sanitizeSetup, sortQuali, startGridMarks, validateSetup } from '../src/race.ts';
 import { locate, makeTrackIndex, mulberry32 } from '../src/sim.ts';
 import { resample } from '../src/track.ts';
 import type { Pt } from '../src/track.ts';
@@ -57,6 +57,19 @@ test('sortQuali ranks finishers by time, DNFs by furthest reached', () => {
     { teamId: 'd', teamName: 'D', name: 'slow', time: 62, progress: 1 },
   ]);
   assert.deepEqual(rows.map((r) => r.name), ['fast', 'slow', 'far', 'short']);
+});
+
+test('lineColor blends continuously: endpoints exact, mids between', () => {
+  assert.equal(lineColor(0, 0), '#9a9a9a');
+  assert.equal(lineColor(1, 0), '#2bff7d');
+  assert.equal(lineColor(0, 1), '#ff3b30');
+  const hex = (s: string) => [1, 3, 5].map((i) => parseInt(s.slice(i, i + 2), 16));
+  const [r, g, b] = hex(lineColor(0.5, 0));
+  assert.ok(r < 154 && g > 154 && b < 154, `half throttle greens the gray: ${lineColor(0.5, 0)}`); // r=85 g=217 b=136
+  const [r2, g2, b2] = hex(lineColor(0, 0.5));
+  assert.ok(r2 > 154 && g2 < 154 && b2 < 154, `half brake reddens the gray: ${lineColor(0, 0.5)}`); // r=217 g=95 b=88
+  const [, g3] = hex(lineColor(0.3, 0));
+  assert.ok(g3 >= 200, `feathered throttle reads green, not murk: ${lineColor(0.3, 0)}`);
 });
 
 test('grid staggers odd slots and clears boxes, even in corners', () => {

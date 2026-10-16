@@ -9,8 +9,8 @@ import type { EpochResult, GAConfig } from './ga.ts';
 import type { GenomeNet } from './nn.ts';
 import { locate, makeTrackIndex, mulberry32, observe, spawn, stepCar, DT } from './sim.ts';
 import type { CarState, TrackIndex } from './sim.ts';
-import { buildRoster, carSizeFor, drawRaceScene, driverName, gridSlots, sanitizeSetup, sortQuali, startGridMarks, validateChamp, validateSetup } from './race.ts';
-import type { Driver, QualiEntry, RaceConfig, SceneCar } from './race.ts';
+import { buildRoster, carSizeFor, drawRaceScene, driverName, gridSlots, lineColor, sanitizeSetup, sortQuali, startGridMarks, validateChamp, validateSetup } from './race.ts';
+import type { Driver, QualiEntry, RaceConfig, SceneCar, TrailPt } from './race.ts';
 import { blankTeam, drawCarPreview, physicsFor, sanitizeTeam, teamErrors } from './teams.ts';
 import type { PhysicsParams, Team } from './teams.ts';
 
@@ -1089,6 +1089,8 @@ function stopPracticeAll() {
 // state plus the saved session. Selections (raceCfg), teams, tracks and trained
 // weights persist — only the event itself is forgotten.
 function resetRaceSession() {
+  enteringPractice = false;
+  enteringQuali = false;
   stopPracticeAll();
   terminateAllWorkers(); // in-flight epochs die; their late results are dropped (team left)
   if (quali) quali.aborted = true;
@@ -1098,6 +1100,9 @@ function resetRaceSession() {
   raceRunning = false;
   raceCars = [];
   raceIdx = null;
+  qualiSel = null;
+  raceSel = null;
+  qualiTrails.clear();
   stopPreviewLoop();
   practiceTeams = [];
   practiceIdx = null;
@@ -1108,12 +1113,18 @@ function resetRaceSession() {
 function fmtFit(f: number) { return Number.isFinite(f) ? f.toFixed(0) : '—'; }
 
 
+let practiceGen = 0; // bumped every entry: late epochs from a previous event are dropped
+let enteringPractice = false; // async re-entry guard: double Begin clicks share one build
 async function enterPractice(): Promise<boolean> {
   if (!raceCfg) return false;
   const tracks = await listTracks();
   const t = tracks.find((x) => x.id === raceCfg!.trackId);
   if (!t) { say('Saved track is gone — pick another.'); setRacePane('setup'); return false; }
+  const myGen = ++practiceGen;
+  if (enteringPractice) return false;
+  enteringPractice = true;
   stopPracticeAll();
+  terminateAllWorkers(); // fresh pool: no old epoch can occupy a slot or write late
   const net = practiceNet ?? (practiceNet = buildNet());
   practiceIdx = makeTrackIndex(t);
   const cfg = practiceCfg();
@@ -1215,6 +1226,7 @@ function sessionCfg(): { exploreN: number; finalizeN: number } {
 // Hands-off session: every team trains from epoch 0 to total; explore flips to
 // finalize per team at exploreN; Start Quali unlocks when all teams finish.
 function beginSession() {
+  enteringPractice = false;
   const { exploreN, finalizeN } = sessionCfg();
   session = { exploreN, total: exploreN + finalizeN, done: false };
   for (const st of practiceTeams) { st.status = 'training'; st.finalize = false; st.previewedAt = -1; }
@@ -1354,7 +1366,7 @@ async function scheduler() {
           if (st.status !== 'training' || inFlight.has(key(st, i))) continue;
           inFlight.add(key(st, i));
           dispatched = true;
-          void trainIslandEpoch(st, st.islands[i], i).finally(() => { inFlight.delete(key(st, i)); updatePracticeCards(); });
+          void trainIslandEpoch(st, st.islands[i], i, practiceGen).finally(() => { inFlight.delete(key(st, i)); updatePracticeCards(); });
         }
       }
       await sleep(dispatched ? 100 : 250);
@@ -1379,7 +1391,7 @@ function refreshTeamBest(st: TeamTrain) {
 }
 
 
-async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
+async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number, myGen: number) {
   const team = teams.find((t) => t.id === st.teamId);
   if (!team || !practiceIdx || !practiceNet) return;
   const net = practiceNet; // narrowed copy for closures below
@@ -1419,11 +1431,11 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
   } catch {
     // worker died mid-epoch: drop it, retry once inline (unless the team is gone/stopped)
     if (w) { try { w.terminate(); } catch { /* gone */ } teamWorkers.delete(key); }
-    if (!practiceTeams.some((s) => s.teamId === st.teamId) || st.status !== 'training') { updatePracticeCards(); return; }
+    if (myGen !== practiceGen || !practiceTeams.some((s) => s.teamId === st.teamId) || st.status !== 'training') { updatePracticeCards(); return; }
     const seed2 = (isl.seed = (isl.seed + 1) >>> 0);
     r = await runEpoch(practiceIdx, phys, isl.pop, ecfg, seed2, stop);
   }
-  if (!practiceTeams.some((s) => s.teamId === st.teamId)) return; // team left mid-epoch: drop the result
+  if (myGen !== practiceGen || !practiceTeams.some((s) => s.teamId === st.teamId)) return; // stale event or team left mid-epoch: drop the result
   isl.pop = r.pop;
   if (r.partial) { updatePracticeCards(); return; }
   isl.epoch++;
@@ -1440,7 +1452,7 @@ async function trainIslandEpoch(st: TeamTrain, isl: Island, islIdx: number) {
       const rc = w2
         ? await runWorkerEpoch(w2, { idx: practiceIdx, phys, pop: [r.best.slice()], cfg: ecfg, seed: cseed })
         : await runEpoch(practiceIdx, phys, [r.best.slice()], ecfg, cseed, stop);
-      if (!practiceTeams.some((s) => s.teamId === st.teamId)) return;
+      if (myGen !== practiceGen || !practiceTeams.some((s) => s.teamId === st.teamId)) return;
       if (!rc.partial) confirmFit = (r.bestFitness + rc.bestFitness) / 2;
     } catch { /* confirm failed: fall back to single eval */ }
     if (!isl.best || confirmFit > isl.bestFit) {
@@ -1564,13 +1576,17 @@ function updateQualiGate() {
 interface QualiRun { roster: Driver[]; entries: QualiEntry[]; idx: number; seed: number; aborted: boolean; running: boolean }
 let quali: QualiRun | null = null;
 let qualiIdx: TrackIndex | null = null;
+let qualiGen = 0; // bumped every entry: stale loops/epochs from a previous run bail out
+let enteringQuali = false; // async re-entry guard: double clicks share one build
 
 async function enterQuali(fixedNames?: string[]) {
-  if (!raceCfg) return;
+  if (!raceCfg || quali?.running || enteringQuali) return;
+  enteringQuali = true;
+  const myGen = ++qualiGen;
   stopPracticeAll();
   const tracks = await listTracks();
   const t = tracks.find((x) => x.id === raceCfg!.trackId);
-  if (!t) { say('Saved track is gone — pick another.'); setRacePane('setup'); return; }
+  if (!t) { enteringQuali = false; say('Saved track is gone — pick another.'); setRacePane('setup'); return; }
   if (!practiceNet) practiceNet = buildNet();
   qualiIdx = makeTrackIndex(t);
   const pops = new Map<string, number[][]>();
@@ -1584,21 +1600,22 @@ async function enterQuali(fixedNames?: string[]) {
     if (w) bests.set(id, w.weights);
     names.set(id, team.name);
   }
-  const saved = await loadRaceSession();
-  const sameCfg = saved && saved.stage === 'quali' && saved.cfg.trackId === raceCfg.trackId
-    && saved.cfg.teamIds.join() === raceCfg.teamIds.join() && saved.cfg.drivers === raceCfg.drivers && saved.cfg.laps === raceCfg.laps;
-  const seed = sameCfg ? saved.seed : (Math.random() * 2 ** 31) | 0;
+  // entering quali always starts fresh: a half-run saved session never resumes
+  // (abandoned runs looked "already in progress" on return).
+  const seed = (Math.random() * 2 ** 31) | 0;
   const roster = buildRoster(raceCfg.teamIds, names, raceCfg.drivers, pops, bests, mulberry32(seed));
   if (fixedNames?.length === roster.length) roster.forEach((d, i) => (d.name = fixedNames[i])); // champ: stable driver names across races
-  quali = { roster, entries: sameCfg ? saved.quali.map((e) => ({ ...e, teamName: names.get(e.teamId) ?? e.teamId })) : [], idx: 0, seed, aborted: false, running: false };
+  quali = { roster, entries: [], idx: 0, seed, aborted: false, running: false };
+  qualiSel = null;
+  qualiTrails.clear();
   quali.idx = quali.entries.length; // completed count (finish order, not roster order)
   (gid('btn-start-race') as HTMLButtonElement).disabled = true;
   setRacePane('quali');
   drawQualiScene([]); // immediate first paint so the canvas never sits blank
   renderQualiBoard();
   void renderLastResults();
-  if (sameCfg && quali.idx > 0) say(`Qualifying resumed with ${quali.idx} placed drivers.`);
-  void qualiLoop();
+  enteringQuali = false;
+  void qualiLoop(myGen);
 }
 
 function qualiTimeout(): number {
@@ -1618,9 +1635,10 @@ interface QualiRunner {
   d: Driver; car: CarState; genome: Float32Array; phys: PhysicsParams;
   color: string; secondary: string;
   hint: number; prevFrac: number | null; prog: number; best: number; time: number; frames: number; stallT: number; stallProg: number;
-  tZero: number | null; done: boolean;
+  tZero: number | null; done: boolean; trail: TrailPt[];
 }
 let qualiLive: QualiRunner[] = [];
+let qualiTrails = new Map<string, { color: string; trail: TrailPt[] }>(); // finished laps, kept for post-quali selection
 // ponytail: quali stall rule — under 1% progress in 3s of drive time = DNF.
 // (Race uses a speed-based rule below: fair from a standing start.)
 function stalled(c: { prog: number; time: number; stallT: number; stallProg: number }): boolean {
@@ -1645,8 +1663,8 @@ function raceStalled(r: { time: number; prog: number; spdT: number; spdAcc: numb
   return false;
 }
 
-async function qualiLoop() {
-  if (!quali || !qualiIdx || !practiceNet || quali.running) return;
+async function qualiLoop(myGen: number) {
+  if (myGen !== qualiGen || !quali || !qualiIdx || !practiceNet || quali.running) return;
   quali.running = true;
   const timeout = qualiTimeout();
   try {
@@ -1654,7 +1672,7 @@ async function qualiLoop() {
     const lineup = quali.roster.filter((d) => !doneKeys.has(d.teamId + '|' + d.name));
     qualiLive = lineup.map((d) => {
       const team = teams.find((t) => t.id === d.teamId)!;
-      return { d, car: { x: 0, y: 0, heading: 0, vx: 0, vy: 0 }, genome: new Float32Array(d.genome), phys: physicsFor(team), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, best: 0, time: 0, frames: 0, stallT: 0, stallProg: 0, tZero: null, done: false };
+      return { d, car: { x: 0, y: 0, heading: 0, vx: 0, vy: 0 }, genome: new Float32Array(d.genome), phys: physicsFor(team), color: team.primary, secondary: team.secondary, hint: -1, prevFrac: null, prog: 0, best: 0, time: 0, frames: 0, stallT: 0, stallProg: 0, tZero: null, done: false, trail: [] };
     });
     if (qualiLive.length) {
       const slot = gridSlots(qualiIdx, 1)[0]; // quali: everyone launches from the same spot
@@ -1664,9 +1682,10 @@ async function qualiLoop() {
       const qProg0 = -((((qStartFr - projectFraction(qualiIdx.track.centerline, qualiIdx.track.closed, [slot.x, slot.y])) % 1) + 1) % 1);
       qualiLive.forEach((r) => { r.car = { x: slot.x, y: slot.y, heading: slot.heading, vx: 0, vy: 0 }; r.prog = qProg0; r.best = qProg0; r.stallT = 0; r.stallProg = qProg0; });
       say(`Qualifying — ${qualiLive.length} driver${qualiLive.length === 1 ? '' : 's'} on track together.`);
-      await animateQualiAll(timeout);
+      await animateQualiAll(timeout, myGen);
     }
   } finally {
+    if (myGen !== qualiGen) return; // superseded: the new run owns qualiLive now
     qualiLive = [];
     if (quali) {
       quali.idx = quali.entries.length;
@@ -1677,18 +1696,19 @@ async function qualiLoop() {
   }
 }
 
-function animateQualiAll(timeout: number): Promise<void> {
+function animateQualiAll(timeout: number, myGen: number): Promise<void> {
   return new Promise((resolve) => {
     const idx = qualiIdx!;
     const finish = (r: QualiRunner, time: number | null) => {
       r.done = true;
-      if (!quali) return;
+      qualiTrails.set(driverKey(r.d.teamId, r.d.name), { color: r.color, trail: r.trail });
+      if (myGen !== qualiGen || !quali) return;
       quali.entries.push({ teamId: r.d.teamId, teamName: r.d.teamName, name: r.d.name, time, progress: r.best });
       quali.idx = quali.entries.length;
       saveRaceSession({ stage: 'quali', cfg: raceCfg!, seed: quali.seed, quali: quali.entries, nextIdx: quali.idx }).catch(() => {});
     };
     const step = () => {
-      if (!quali || quali.aborted || !practiceNet) return resolve();
+      if (myGen !== qualiGen || !quali || quali.aborted || !practiceNet) return resolve();
       try {
         let allDone = true;
         for (const r of qualiLive) {
@@ -1700,12 +1720,14 @@ function animateQualiAll(timeout: number): Promise<void> {
           let df = loc.frac - r.prevFrac;
           if (df > 0.5) df -= 1; else if (df < -0.5) df += 1;
           r.prog += df; if (r.prog > r.best) r.best = r.prog; r.prevFrac = loc.frac;
+          const qctl = forwardGenome(r.genome, observe(idx, r.car, loc));
+          r.trail.push({ x: r.car.x, y: r.car.y, th: qctl[0], br: qctl[1] });
           if (r.tZero == null && r.prog >= 0) r.tZero = r.time;
           if (loc.dist > loc.hw) finish(r, null);
           else if (r.prog >= 1) finish(r, r.time - (r.tZero ?? 0));
           else if (stalled(r)) finish(r, null);
           else if (r.time >= timeout || ++r.frames > 60 * 120) finish(r, null);
-          else { stepCar(r.car, forwardGenome(r.genome, observe(idx, r.car, loc)), r.phys); r.time += DT; }
+          else { stepCar(r.car, qctl, r.phys); r.time += DT; }
         }
         drawQualiScene(qualiLive.map((r) => ({ x: r.car.x, y: r.car.y, heading: r.car.heading, color: r.color, secondary: r.secondary, dim: r.done })));
         renderQualiBoard();
@@ -1723,6 +1745,18 @@ function drawQualiScene(cars: (SceneCar & { secondary: string })[]) {
   const ctx = cv.getContext('2d')!;
   drawRaceScene(ctx, cv.width, cv.height, idx.track.centerline, idx.left, idx.right, ribbon(idx.track), trackBg(idx.track, () => { if (qualiIdx && !quali?.running) drawQualiScene([]); }), startGridMarks(idx, quali?.roster.length ?? eventGridN()));
   drawSessionCars(ctx, cars.map((c) => ({ x: c.x, y: c.y, heading: c.heading, primary: c.color, secondary: c.secondary, dim: c.dim })), carSizeFor(idx.track.width));
+  if (qualiSel) {
+    const size = carSizeFor(idx.track.width);
+    const live = qualiLive.find((r) => driverKey(r.d.teamId, r.d.name) === qualiSel);
+    if (live) drawHighlight(ctx, live.car.x, live.car.y, size, live.trail, []);
+    else {
+      const past = qualiTrails.get(qualiSel);
+      if (past && past.trail.length > 1) {
+        const p = past.trail[past.trail.length - 1];
+        drawHighlight(ctx, p.x, p.y, size, past.trail, []);
+      }
+    }
+  }
 }
 
 function fmtTime(t: number) {
@@ -1730,10 +1764,14 @@ function fmtTime(t: number) {
 }
 
 function medal(i: number) { return i === 0 ? ' p1' : i === 1 ? ' p2' : i === 2 ? ' p3' : ''; }
-function boardRow(ul: HTMLElement, o: { pos: string; mi: number; color: string; team: string; name: string; meta: string; metaBad?: boolean; live?: boolean; dim?: boolean; liveId?: string }) {
+function boardRow(ul: HTMLElement, o: { pos: string; mi: number; color: string; team: string; name: string; meta: string; metaBad?: boolean; live?: boolean; dim?: boolean; liveId?: string; selected?: boolean; key?: string }) {
   const li = document.createElement('li');
   if (o.live) li.className = 'live';
   else if (o.dim) li.className = 'dim';
+  if (o.selected) li.classList.add('sel');
+  // selection reads ul.onmousedown (set per render): press/release land on
+  // different rebuilt nodes mid-race, so click never fires at all.
+  if (o.key) { li.classList.add('clickable'); li.dataset.key = o.key; }
   const pos = document.createElement('span'); pos.className = 'bpos' + medal(o.mi); pos.textContent = o.pos;
   const bar = document.createElement('span'); bar.className = 'bbar'; bar.style.background = o.color;
   const main = document.createElement('span'); main.className = 'bmain';
@@ -1747,8 +1785,64 @@ function boardRow(ul: HTMLElement, o: { pos: string; mi: number; color: string; 
   ul.appendChild(li);
 }
 
+let qualiSel: string | null = null; // single highlighted driver (teamId|name)
+let raceSel: string | null = null;
+const driverKey = (teamId: string, name: string) => `${teamId}|${name}`;
+
+// selected driver: white ring + racing lines in track space after cars.
+// Current lap action-painted (green = throttle, red = brake, gray = coast);
+// older laps gray, fading with age.
+function strokeColoredLine(ctx: CanvasRenderingContext2D, pts: TrailPt[], width: number, single?: string) {
+  let cur = '';
+  ctx.lineWidth = width;
+  for (let i = 0; i < pts.length; i++) {
+    const c = single ?? lineColor(pts[i].th, pts[i].br);
+    if (c !== cur) {
+      if (i > 0) ctx.stroke();
+      ctx.beginPath();
+      ctx.strokeStyle = c;
+      if (i > 0) ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+      cur = c;
+    }
+    ctx.lineTo(pts[i].x, pts[i].y);
+  }
+  if (pts.length) ctx.stroke();
+}
+function drawHighlight(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, cur: TrailPt[], past: TrailPt[][]) {
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  past.forEach((lap, i) => {
+    if (lap.length < 2) return;
+    ctx.save();
+    ctx.globalAlpha = 0.5 * Math.pow(0.55, past.length - 1 - i);
+    strokeColoredLine(ctx, lap, 3, '#8a8a8a');
+    ctx.restore();
+  });
+  if (cur.length > 1) {
+    strokeColoredLine(ctx, cur, 5, 'rgba(255,255,255,0.9)');
+    strokeColoredLine(ctx, cur, 2.5);
+  }
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(x, y, size * 0.85, 0, Math.PI * 2); ctx.stroke();
+}
+function toggleQualiSel(key: string) {
+  qualiSel = qualiSel === key ? null : key;
+  renderQualiBoard();
+  if (!quali?.running) drawQualiScene([]);
+}
+function toggleRaceSel(key: string) {
+  raceSel = raceSel === key ? null : key;
+  renderRaceBoard();
+  if (!raceRunning) drawRaceSceneOnCanvas();
+}
 function renderQualiBoard() {
   const ul = gid('quali-board');
+  ul.onmousedown = (e) => {
+    // hit-test press coords: press/release land on different rebuilt nodes,
+    // so click never fires mid-race.
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const k = (el?.closest('li') as HTMLElement | null)?.dataset.key;
+    if (k) toggleQualiSel(k);
+  };
   ul.innerHTML = '';
   const ranked = sortQuali(quali?.entries ?? []);
   const p1 = ranked.find((e) => e.time != null)?.time;
@@ -1761,6 +1855,7 @@ function renderQualiBoard() {
     row({
       pos: '', mi: 0, color: team?.primary ?? '#888', team: e.teamName, name: e.name,
       meta: p1 != null && e.time !== p1 ? `+${(e.time! - p1).toFixed(2)}` : fmtTime(e.time!),
+      selected: qualiSel === driverKey(e.teamId, e.name), key: driverKey(e.teamId, e.name),
     }, true);
   });
   const rest: { sort: number; live?: (typeof qualiLive)[number]; entry?: QualiEntry }[] = [
@@ -1772,12 +1867,14 @@ function renderQualiBoard() {
       row({
         pos: '', mi: -1, color: r.color, team: r.d.teamName, name: r.d.name,
         meta: `${fmtTime(r.time - (r.tZero ?? 0))} · ${(Math.max(0, r.prog) * 100).toFixed(0)}%`, live: true,
+        selected: qualiSel === driverKey(r.d.teamId, r.d.name), key: driverKey(r.d.teamId, r.d.name),
       }, false);
     } else if (e) {
       const team = teams.find((t) => t.id === e.teamId);
       row({
         pos: '', mi: 0, color: team?.primary ?? '#888', team: e.teamName, name: e.name,
         meta: `DNF · ${(Math.max(0, e.progress ?? 0) * 100).toFixed(0)}%`, metaBad: true,
+        selected: qualiSel === driverKey(e.teamId, e.name), key: driverKey(e.teamId, e.name),
       }, false);
     }
   });
@@ -1803,20 +1900,23 @@ gid('btn-start-quali').onclick = () => { void enterQuali(champRace && champ ? ch
 // ---- race session (Story 4, subtask 8) ----
 interface RaceCar {
   teamId: string; teamName: string; name: string; car: CarState; genome: Float32Array; phys: PhysicsParams;
-  color: string; hint: number; prevFrac: number | null; prog: number; bestProg: number; spdT: number; spdAcc: number; prgT: number; prgMark: number;
+  color: string; hint: number; prevFrac: number | null; prog: number; bestProg: number; spdT: number; spdAcc: number; prgT: number; prgMark: number; trail: TrailPt[]; laps: TrailPt[][];
   time: number;
   done: boolean; dnf: boolean; finishTime: number | null;
   gateMap: Map<string, number>; // start/finish-line crossing times (key = lap:-1) for gap timing
+  gapLockFor: string | null; gapLock: string | null; // frozen gap vs a finished car ahead
 }
 let raceCars: RaceCar[] = [];
 let raceIdx: TrackIndex | null = null;
 let raceRunning = false;
 let raceAbort = false;
+let raceGen = 0; // bumped every entry: stale lights/step loops from a previous run bail out
 let raceLaps = 3;
 
 
 async function enterRace() {
-  if (!raceCfg || !quali || quali.idx < quali.roster.length) return;
+  if (!raceCfg || !quali || quali.idx < quali.roster.length || raceRunning) return;
+  const myGen = ++raceGen;
   const tracks = await listTracks();
   const t = tracks.find((x) => x.id === raceCfg!.trackId);
   if (!t) { say('Saved track is gone — pick another.'); return; }
@@ -1827,6 +1927,7 @@ async function enterRace() {
   const slots = gridSlots(raceIdx, order.length);
   const m = raceIdx.n; // grid-slot arc scale for the prog rebase below
   try {
+  raceSel = null;
   raceCars = order.map((e, i) => {
     const team = teams.find((x) => x.id === e.teamId)!;
     const qd = quali!.roster.find((d) => d.name === e.name && d.teamId === e.teamId)!;
@@ -1839,7 +1940,7 @@ async function enterRace() {
       teamId: e.teamId, teamName: e.teamName, name: e.name, phys: physicsFor(team),
       car: { x: slots[i].x, y: slots[i].y, heading: slots[i].heading, vx: 0, vy: 0 },
       genome: new Float32Array(qd.genome), color: team.primary,
-      hint: -1, prevFrac: null, prog: prog0, bestProg: prog0, time: 0, spdT: 0, spdAcc: 0, prgT: 0, prgMark: prog0, gateMap: new Map(),
+      hint: -1, prevFrac: null, prog: prog0, bestProg: prog0, time: 0, spdT: 0, spdAcc: 0, prgT: 0, prgMark: prog0, gateMap: new Map(), trail: [], laps: [], gapLockFor: null, gapLock: null,
       done: false, dnf: false, finishTime: null,
     };
   });
@@ -1848,32 +1949,34 @@ async function enterRace() {
   setRacePane('race');
   drawRaceSceneOnCanvas();
   renderRaceBoard();
-  void runStartLights();
+  void runStartLights(myGen);
 }
 
 // F1 start: 5 lamps at 0.6s intervals, random 0.4–1.8s hold, then lights out.
 // Cars sit on the grid until the lamps go — raceStep only runs after.
-async function runStartLights() {
+async function runStartLights(myGen: number) {
   const el = gid('race-lights');
   el.hidden = false;
   const lamps = [...el.querySelectorAll('.light')];
   lamps.forEach((l) => l.classList.remove('on'));
   for (const lamp of lamps) {
     await sleep(600);
+    if (myGen !== raceGen) return; // superseded: new run owns the lamps now
     if (raceAbort || !raceIdx) { el.hidden = true; return; }
     lamp.classList.add('on');
   }
   await sleep(400 + Math.random() * 1400);
+  if (myGen !== raceGen) return;
   if (raceAbort || !raceIdx) { el.hidden = true; return; }
   lamps.forEach((l) => l.classList.remove('on'));
   say('LIGHTS OUT!');
   raceRunning = true;
-  requestAnimationFrame(raceStep);
-  window.setTimeout(() => { el.hidden = true; }, 1200);
+  requestAnimationFrame(() => raceStep(myGen));
+  window.setTimeout(() => { if (myGen === raceGen) el.hidden = true; }, 1200);
 }
 
-function raceStep() {
-  if (!raceRunning || raceAbort || !raceIdx || !practiceNet) return;
+function raceStep(myGen: number) {
+  if (myGen !== raceGen || !raceRunning || raceAbort || !raceIdx || !practiceNet) return;
   let allDone = true;
   for (const r of raceCars) {
     if (r.done) continue;
@@ -1886,26 +1989,38 @@ function raceStep() {
     if (df > 0.5) df -= 1;
     else if (df < -0.5) df += 1;
     r.prog += df; if (r.prog > r.bestProg) r.bestProg = r.prog;
+    const rctl = forwardGenome(r.genome, observe(raceIdx, r.car, loc));
+    const pt: TrailPt = { x: r.car.x, y: r.car.y, th: rctl[0], br: rctl[1] };
+    r.trail.push(pt);
     // start/finish-line crossings feed lap times for gap timing (line-relative
     // prog: integer crossings ARE line crossings since the grid rebase)
     const lapNow = Math.floor(r.prog);
     if (Math.floor(r.prog - df) < lapNow) {
       const k = `${lapNow}:-1`;
-      if (!r.gateMap.has(k)) r.gateMap.set(k, r.time);
+      if (!r.gateMap.has(k)) {
+        r.gateMap.set(k, r.time);
+        // new lap: current line joins history (except the grid stub on lap 0),
+        // fresh one starts at the line
+        if (lapNow >= 1) {
+          r.laps.push(r.trail);
+          if (r.laps.length > 9) r.laps.shift();
+        }
+        r.trail = [pt];
+      }
     }
     r.prevFrac = loc.frac;
     if (loc.dist > loc.hw) { r.done = true; r.dnf = true; continue; }
     if (r.prog >= raceLaps) { r.done = true; r.finishTime = r.time; continue; }
     if (raceStalled(r)) { r.done = true; r.dnf = true; continue; }
     if (r.time > 60 * 180) { r.done = true; r.dnf = true; continue; }
-    stepCar(r.car, forwardGenome(r.genome, observe(raceIdx, r.car, loc)), r.phys);
+    stepCar(r.car, rctl, r.phys);
     r.time += DT;
     r.spdAcc += Math.hypot(r.car.vx, r.car.vy) * DT;
     } catch { r.done = true; r.dnf = true; }
   }
   try { drawRaceSceneOnCanvas(); renderRaceBoard(); } catch { /* a bad frame must never kill the race */ }
   if (allDone) { void finishRace(); return; }
-  requestAnimationFrame(raceStep);
+  requestAnimationFrame(() => raceStep(myGen));
 }
 
 function drawRaceSceneOnCanvas() {
@@ -1917,6 +2032,8 @@ function drawRaceSceneOnCanvas() {
     const team = teams.find((t) => t.id === r.teamId);
     return { x: r.car.x, y: r.car.y, heading: r.car.heading, primary: r.color, secondary: team?.secondary ?? '#ffffff', dim: r.done };
   }), carSizeFor(idx.track.width));
+  const sel = raceSel ? raceCars.find((r) => driverKey(r.teamId, r.name) === raceSel) : undefined;
+  if (sel) drawHighlight(ctx, sel.car.x, sel.car.y, carSizeFor(idx.track.width), sel.trail, sel.laps);
 }
 
 function raceOrder(): RaceCar[] {
@@ -1958,6 +2075,11 @@ function gapToAhead(me: RaceCar, ahead: RaceCar): string | null {
 
 function renderRaceBoard() {
   const ul = gid('race-board');
+  ul.onmousedown = (e) => {
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const k = (el?.closest('li') as HTMLElement | null)?.dataset.key;
+    if (k) toggleRaceSel(k);
+  };
   ul.innerHTML = '';
   const ordered = raceOrder();
   const winner = ordered.filter((r) => r.finishTime != null).sort((a, b) => a.finishTime! - b.finishTime!)[0];
@@ -1968,10 +2090,19 @@ function renderRaceBoard() {
       meta = winner && winner !== r && winner.finishTime != null ? `+${(r.finishTime - winner.finishTime).toFixed(2)}` : 'Winner';
     } else if (r.dnf) { meta = 'DNF'; bad = true; }
     else if (i === 0) { meta = 'Leader'; }
-    else { meta = gapToAhead(r, ordered[i - 1]) ?? '—'; }
+    else {
+      // gaps freeze once the car ahead finishes — recomputing against frozen
+      // prog only ever shrinks the number on screen.
+      const ahead = ordered[i - 1], akey = driverKey(ahead.teamId, ahead.name);
+      if (ahead.finishTime != null) {
+        if (r.gapLockFor !== akey) { r.gapLockFor = akey; r.gapLock = gapToAhead(r, ahead); }
+        meta = r.gapLock ?? '—';
+      } else { r.gapLockFor = null; r.gapLock = null; meta = gapToAhead(r, ahead) ?? '—'; }
+    }
     boardRow(ul, {
       pos: `P${i + 1}`, mi: i, color: team?.primary ?? '#888', team: r.teamName, name: r.name,
       meta, metaBad: bad, dim: r.done,
+      selected: raceSel === driverKey(r.teamId, r.name), key: driverKey(r.teamId, r.name),
     });
   });
   const lead = raceOrder().find((r) => !r.done) ?? raceOrder()[0];
@@ -2013,6 +2144,7 @@ gid('btn-practice-back').onclick = () => {
   await saveRaceCfg(raceCfg);
 };
 gid('btn-race-begin').onclick = async () => {
+  champRace = false; // single race owns the event now (stale champ routing dies here)
   const tracks = await listTracks();
   const teamIds = [...gid('race-teams').querySelectorAll<HTMLInputElement>('input:checked')].map((cb) => cb.value);
   const input = {
@@ -2029,6 +2161,7 @@ gid('btn-race-begin').onclick = async () => {
   if (await enterPractice()) setRacePane('practice');
 };
 gid('btn-race-skip').onclick = async () => {
+  champRace = false;
   const tracks = await listTracks();
   const teamIds = [...gid('race-teams').querySelectorAll<HTMLInputElement>('input:checked')].map((cb) => cb.value);
   const input = {
